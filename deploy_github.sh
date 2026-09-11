@@ -15,10 +15,18 @@ ASSETS="$SITE/assets"
 mkdir -p "$ASSETS"
 cd "$SITE"
 
-if ! gh auth status >/dev/null 2>&1; then
-  echo "[错误] 未登录 GitHub。请在已授权的新会话中运行，或用 GH_TOKEN 运行。"
+# 从私有凭据文件读取 token（须在仓库之外），无则用环境变量 GH_TOKEN
+if [ -z "${GH_TOKEN:-}" ] && [ -f "$ROOT/.secrets/.github_token" ]; then
+  export GH_TOKEN=$(cat "$ROOT/.secrets/.github_token")
+fi
+if [ -z "${GH_TOKEN:-}" ] && [ -f "$ROOT/himawari_site_token" ]; then
+  export GH_TOKEN=$(cat "$ROOT/himawari_site_token")
+fi
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "[错误] 未找到 GitHub token（.secrets 或 GH_TOKEN）"
   exit 1
 fi
+export GH_PROMPT_DISABLED=1
 OWNER=$(gh api user --jq .login)
 REPO="himawari-observation"
 FULL="$OWNER/$REPO"

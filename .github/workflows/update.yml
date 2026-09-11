@@ -1,0 +1,75 @@
+name: Update Himawari Cloud Images
+
+# 每小时的固定时间运行；也支持手动触发和 push 触发。
+on:
+  schedule:
+    - cron: '15 * * * *'        # 每小时的第 15 分钟（Actions 的 cron 为 UTC）
+  workflow_dispatch:            # 允许在 Actions 页手动点 Run
+  push:
+    branches: [main]
+    paths: ['scripts/**']
+
+permissions:
+  contents: write               # 允许工作流把更新后的图推回仓库
+
+concurrency:
+  group: himawari-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet satpy cartopy xarray matplotlib
+
+      - name: Generate latest IR image (and detect obs time)
+        id: gen
+        working-directory: scripts
+        run: |
+          LOG=$(python himawari_s3_cloud_map.py --latest --composite B13 --out ../assets/ir_latest.png 2>&1)
+          echo "$LOG" | tail -3
+          TIME_UTC=$(echo "$LOG" | grep -oE '[0-9]{12}' | head -1)
+          echo "utc=$TIME_UTC" >> "$GITHUB_OUTPUT"
+
+      - name: Generate latest cloud-type image
+        working-directory: scripts
+        run: |
+          T="${{ steps.gen.outputs.utc }}"
+          if [ -n "$T" ]; then
+            python himawari_cloud_type.py --time "$T" --out ../assets/cloudtype_latest.png
+          else
+            python himawari_cloud_type.py --latest --out ../assets/cloudtype_latest.png
+          fi
+
+      - name: Update observation timestamp in index.html
+        run: |
+          T="${{ steps.gen.outputs.utc }}"
+          if [ -n "$T" ]; then
+            sed -i -E "s/const utc = \"[0-9]{12}\";/const utc = \"$T\";/" index.html
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.name "himawari-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无内容变更，跳过推送"
+          else
+            git commit -m "auto update Himawari images $(date -u +%Y%m%d%H%M) UTC"
+            git pull --no-edit --ff-only origin main || true
+            git push
+            echo "已推送最新云图"
+          fi
