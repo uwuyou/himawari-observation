@@ -117,6 +117,23 @@
     </section>
   </div>
 
+  <div class="grid" style="margin-top:6px">
+    <section class="card">
+      <div class="card-head">
+        <div class="card-title"><span class="tag ir" style="background:rgba(120,80,200,.2);color:#b088ff">NM · RGB</span> 夜间微物理合成</div>
+        <div class="mono">NIGHT MICROPHYSICS</div>
+      </div>
+      <div class="imgbox" data-empty="1">
+        <div class="load-note">AWAITING FRAME</div>
+        <img src="assets/night_microphysics_latest.png" alt="最新夜间微物理合成图" loading="lazy">
+      </div>
+      <div class="card-foot">
+        <span class="mono">RGB：R=BTD<sub>B15-B13</sub> G=BTD<sub>B13-B07</sub> B=BT13 · JMA 雾监测技术</span>
+        <span class="mono" id="nm_time">--</span>
+      </div>
+    </section>
+  </div>
+
   <div class="legend">
     <span><i class="dot" style="background:#1f3d5e"></i>晴空</span>
     <span><i class="dot" style="background:#8cbfc7"></i>层云/雾</span>
@@ -135,7 +152,7 @@
 </div>
 
 <script>
-  const utc = "202609111850";
+  const utc = "202609111900";
   function fmtUTC(s){
     if(!s||s.length<12) return "--";
     const Y=s.slice(0,4),Mo=s.slice(4,6),D=s.slice(6,8),H=s.slice(8,10),Mi=s.slice(10,12);
@@ -152,6 +169,7 @@
   document.querySelector(".bjt").textContent = toBJT(utc);
   document.getElementById("ir_time").textContent = fmtUTC(utc);
   document.getElementById("ct_time").textContent = fmtUTC(utc);
+  document.getElementById("nm_time").textContent = fmtUTC(utc);
   // 图片加载完成后隐藏占位
   document.querySelectorAll(".imgbox").forEach(b=>{
     const img=b.querySelector("img");

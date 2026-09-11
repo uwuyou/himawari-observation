@@ -44,9 +44,15 @@ CHINA_BBOX = (70, 3, 140, 55)
 
 
 def _get(url, timeout=180):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    """兼容代理/非代理环境的 HTTP GET。优先用 requests（自动识别 HTTPS_PROXY）。"""
+    try:
+        import requests as _req
+        return _req.get(url, headers={"User-Agent": USER_AGENT},
+                        timeout=timeout).content
+    except ImportError:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
 
 
 def list_keys(bucket, prefix):

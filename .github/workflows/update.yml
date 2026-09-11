@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --quiet --upgrade pip
-          python -m pip install --quiet satpy cartopy xarray matplotlib scipy
+          python -m pip install --quiet satpy cartopy xarray matplotlib scipy requests
 
       - name: Generate latest IR image (and detect obs time)
         id: gen
@@ -61,6 +61,18 @@ jobs:
           else
             echo "IR 时次为空，用 --latest 单独探测"
             python himawari_cloud_type.py --latest --max-back-hours 12 --out ../assets/cloudtype_latest.png
+          fi
+
+      - name: Generate latest Night Microphysics image
+        working-directory: scripts
+        run: |
+          T="${{ steps.gen.outputs.utc }}"
+          if [ -n "$T" ]; then
+            echo "Night Microphysics 基于 IR 时次: $T"
+            python himawari_s3_cloud_map.py --time "$T" --composite night_microphysics --out ../assets/night_microphysics_latest.png
+          else
+            echo "IR 时次为空，用 --latest 单独探测"
+            python himawari_s3_cloud_map.py --latest --max-back-hours 12 --composite night_microphysics --out ../assets/night_microphysics_latest.png
           fi
 
       - name: Update observation timestamp in index.html
