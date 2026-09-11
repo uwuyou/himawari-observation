@@ -84,6 +84,82 @@ def _local_std(arr, win=5):
     return np.sqrt(var)
 
 
+def classify_scene(rs, args, tstr):
+    """
+    输入 satpy 重投影后的 Scene (rs)，返回云分类数组 cls (uint8)。
+    编码:
+      0=晴空 1=层云/雾 2=层积云 3=积云 4=中云 5=深对流 6=卷云 7=层状高云
+    """
+    import numpy as np
+    BT = rs["B13"].values.astype("float64")
+    BT15 = rs["B15"].values.astype("float64")
+    split = BT - BT15
+    BT4 = rs["B07"].values.astype("float64")
+    WB4 = BT4 - BT
+
+    REF = rs["B02"].values.astype("float64")
+    REF5 = rs["B05"].values.astype("float64")
+
+    bbox = tuple(float(x) for x in args.bbox.split(","))
+    lon0, lat0, lon1, lat1 = bbox
+    hh, ww = REF.shape[0], REF.shape[1]
+    _lons = lon0 + (np.arange(ww) + 0.5) * (lon1 - lon0) / ww
+    _lats = lat0 + (np.arange(hh) + 0.5) * (lat1 - lat0) / hh
+    LON, LAT = np.meshgrid(_lons, _lats)
+    cosZ = _cos_solar_zenith(tstr.replace("-","").replace(":","").replace(" ",""),
+                             LON, LAT)
+    normREF = REF / np.clip(cosZ, 0.15, 1.0)
+    daytime = bool(np.nanmedian(cosZ) > 0.25) if cosZ.size else False
+
+    eps = 1e-6
+    snow = (REF - REF5) / (REF + REF5 + eps) > args.thr_snow
+
+    dem_high = None
+    if args.dem:
+        dem_high = _dem_high_region(args.dem, lon0, lat0, lon1, lat1,
+                                    rs["B13"].shape, args.dem_thr)
+
+    BT_std = _local_std(BT, win=args.texture_win)
+
+    cls = np.zeros(BT.shape, dtype=np.uint8)
+    valid = np.isfinite(BT)
+
+    # 高云
+    high = valid & (BT < args.thr_high)
+    cb = high & (BT < args.thr_dc)
+    cls[cb] = 5
+    cir = high & ~cb & (split >= args.cir_split)
+    cls[cir] = 6
+    dense = high & ~cb & ~cir
+    cls[dense] = 7
+
+    # 中云
+    mid = valid & (BT >= args.thr_high) & (BT < args.thr_mid)
+    cls[mid] = 4
+
+    # 低云
+    low_candidate = valid & (BT >= args.thr_mid) & (BT <= args.thr_low_max)
+    if daytime:
+        low = low_candidate & (normREF > args.ref_thr)
+        low = low & ~snow
+        if dem_high is not None:
+            low = low & ~dem_high
+        st = low & (BT_std < args.texture_sc)
+        sc_cld = low & (BT_std >= args.texture_sc) & (BT_std < args.texture_cu)
+        cu = low & (BT_std >= args.texture_cu)
+        cls[st] = 1; cls[sc_cld] = 2; cls[cu] = 3
+    else:
+        low = low_candidate & (WB4 > args.thr_bt47_night)
+        if low.any():
+            cu = low & (BT_std >= args.texture_cu)
+            rest = low & ~cu
+            st = rest & (np.abs(split) < 1.5)
+            sc_cld = rest & ~st
+            cls[st] = 1; cls[sc_cld] = 2; cls[cu] = 3
+
+    return cls, daytime, LON, LAT, BT
+
+
 def main():
     import himawari_s3_cloud_map as base  # 复用其下载/发现逻辑
 
@@ -223,84 +299,9 @@ def main():
     # ---- 局地纹理（参考 HCAI 邻域分析区分 Cu/Sc/St） ----
     BT_std = _local_std(BT, win=args.texture_win)
 
-    # ---- 分类（参考 HCAI 云类型体系） ----
-    #  编码映射：
-    #   0 晴空
-    #   1 层云/雾（St/Fg）   — 低云，纹理平坦
-    #   2 层积云（Sc）        — 低云，纹理中等
-    #   3 积云（Cu）          — 低云，纹理起伏大
-    #   4 中云（CM）
-    #   5 深对流（Cb）
-    #   6 卷云（CH）         — 半透明冰云
-    #   7 层状高云（Dense） — 不透明高冰云
-    cls = np.zeros(BT.shape, dtype=np.uint8)
+    # ---- 分类 ----
+    cls, daytime, LON, LAT, BT = classify_scene(rs, args, tstr)
     valid = np.isfinite(BT)
-
-    # ---- 辅助掩膜 ----
-    clear_sky = valid.copy()  # 最终未被覆盖的即为晴空
-
-    # ==== 高云：BT13 < thr_high ====
-    high = valid & (BT < args.thr_high)
-    # 深对流（Cb）：极冷顶（参考 HCAI：BT13 < 228-230K 且分裂窗窄=厚冰）
-    # 如果水汽通道可用，附加 BTD_WV ≤ 0K 判据（云顶达对流层顶）
-    cb = high & (BT < args.thr_dc)
-    if args.hcai_mode and BTD_WV is not None:
-        cb = cb & (BTD_WV <= 2.0)  # 水汽通道被云顶遮挡
-    cls[cb] = 5
-
-    # 卷云（CH）：半透明薄冰，分裂窗正差大
-    cir = high & ~cb & (split >= args.cir_split)
-    cls[cir] = 6
-
-    # 层状高云（Dense）：剩余高云（厚冰云）
-    dense = high & ~cb & ~cir
-    cls[dense] = 7
-
-    # ==== 中云：thr_high ≤ BT13 < thr_mid ====
-    mid = valid & (BT >= args.thr_high) & (BT < args.thr_mid)
-    cls[mid] = 4
-
-    # ==== 低云：BT13 ≥ thr_mid（含低云+晴空） ====
-    low_candidate = valid & (BT >= args.thr_mid) & (BT <= args.thr_low_max)
-
-    if daytime:
-        # 白天：用归一化可见光反照率区分低云与晴空地物
-        low = low_candidate & (normREF > args.ref_thr)
-        # 排除积雪和高海拔
-        low = low & ~snow
-        if dem_high is not None:
-            low = low & ~dem_high
-        # 按纹理细分低云
-        st = low & (BT_std < args.texture_sc)       # 层云/雾（平坦）
-        sc_cld = low & (BT_std >= args.texture_sc) & (BT_std < args.texture_cu)  # 层积云
-        cu = low & (BT_std >= args.texture_cu)      # 积云（起伏大）
-        cls[st] = 1
-        cls[sc_cld] = 2
-        cls[cu] = 3
-    else:
-        # 夜间：Night Microphysics 三维判据（参考 JMA 雾监测技术文档）
-        #   WB4 = B07-B13 > 2K → 液态水低云（核心判据）
-        #   SW  = B13-B15 分裂窗 → 光学厚度判据：
-        #      |SW| < 1.5K → 光学厚水云（层云/雾，两个红外通道几乎同温）
-        #      SW 偏差大 → 光学薄或混合相（层积云）
-        #   再配合 BT13 局地纹理区分积云（高起伏）
-        low = low_candidate & (WB4 > args.thr_bt47_night)
-        if low.any():
-            SW = split  # B13-B15
-            # 积云：高纹理（无论分裂窗值）
-            cu = low & (BT_std >= args.texture_cu)
-            # 剩余低云中，用分裂窗分离层云/雾 vs 层积云
-            rest = low & ~cu
-            # 层云/雾：光学厚水云，分裂窗近零
-            st = rest & (np.abs(SW) < 1.5)
-            # 层积云：分裂窗偏差较大
-            sc_cld = rest & ~st
-            cls[st] = 1
-            cls[sc_cld] = 2
-            cls[cu] = 3
-            print(f"[NM] 夜间低云: St={int(st.sum())} Sc={int(sc_cld.sum())} Cu={int(cu.sum())} | "
-                  f"WB4中位={np.nanmedian(WB4[low]):.1f}K SW中位={np.nanmedian(SW[low]):.1f}K",
-                  file=sys.stderr)
 
     # 统计报告
     names = ["晴空", "层云/雾", "层积云", "积云", "中云", "深对流", "卷云", "层状高云"]

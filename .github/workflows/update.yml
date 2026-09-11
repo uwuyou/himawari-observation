@@ -75,6 +75,19 @@ jobs:
             python himawari_s3_cloud_map.py --latest --max-back-hours 12 --composite night_microphysics --out ../assets/night_microphysics_latest.png
           fi
 
+      - name: Generate latest fire cloud prediction (Shanghai)
+        working-directory: scripts
+        run: |
+          T="${{ steps.gen.outputs.utc }}"
+          if [ -n "$T" ]; then
+            echo "火烧云预测基于 IR 时次: $T"
+            python fire_cloud_predict.py --lat 31.23 --lon 121.47 --name 上海 --time "$T" --json ../assets/fire_prediction.json
+          else
+            echo "IR 时次为空，用 --latest 单独探测"
+            python fire_cloud_predict.py --lat 31.23 --lon 121.47 --name 上海 --latest --max-back-hours 12 --json ../assets/fire_prediction.json
+          fi
+          echo "火烧云预测完成"
+
       - name: Update observation timestamp in index.html
         run: |
           T="${{ steps.gen.outputs.utc }}"
