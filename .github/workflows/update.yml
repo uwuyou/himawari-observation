@@ -67,9 +67,13 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "无内容变更，跳过推送"
-          else
-            git commit -m "auto update Himawari images $(date -u +%Y%m%d%H%M) UTC"
-            git pull --no-edit --ff-only origin main || true
-            git push
+            exit 0
+          fi
+          git commit -m "auto update Himawari ${UTC_NOW:-$(date -u +%Y%m%d%H%M)}"
+          # 拉取并发产生的新提交后再推，避免非快进被拒
+          git pull --rebase origin main 2>/dev/null || true
+          if git push 2>&1; then
             echo "已推送最新云图"
+          else
+            git push --force-with-lease origin main 2>&1 | tail -3
           fi

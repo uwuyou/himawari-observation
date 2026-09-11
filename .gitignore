@@ -1,0 +1,11 @@
+# 下载缓存（大体积二进制，不入库）
+scripts/himawari_cache/
+**/himawari_cache/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地凭据文件（绝不入库）
+*.token
+.secrets/
