@@ -81,12 +81,12 @@ jobs:
           T="${{ steps.gen.outputs.utc }}"
           if [ -n "$T" ]; then
             echo "火烧云预测基于 IR 时次: $T"
-            python fire_cloud_predict.py --lat 31.23 --lon 121.47 --name 上海 --time "$T" --json ../assets/fire_prediction.json
+            python fire_cloud_predict.py --lat 31.23 --lon 121.47 --name 上海 --time "$T" --json ../assets/fire_prediction.json --export-cloud-json ../assets/cloud_data.json
           else
             echo "IR 时次为空，用 --latest 单独探测"
-            python fire_cloud_predict.py --lat 31.23 --lon 121.47 --name 上海 --latest --max-back-hours 12 --json ../assets/fire_prediction.json
+            python fire_cloud_predict.py --lat 31.23 --lon 121.47 --name 上海 --latest --max-back-hours 12 --json ../assets/fire_prediction.json --export-cloud-json ../assets/cloud_data.json
           fi
-          echo "火烧云预测完成"
+          echo "火烧云预测完成，云数据已导出"
 
       - name: Update observation timestamp in index.html
         run: |
