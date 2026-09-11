@@ -1,9 +1,11 @@
 name: Update Himawari Cloud Images
 
 # 每小时的固定时间运行；也支持手动触发和 push 触发。
+# NOAA 每 10 分钟生成一个时次，上传到 AWS S3 约滞后 1-3 小时。
+# 每 30 分钟触发一次，能在新数据到达后 ~15 分钟内捕捉到并更新网站。
 on:
   schedule:
-    - cron: '15 * * * *'        # 每小时的第 15 分钟（Actions 的 cron 为 UTC）
+    - cron: '5,35 * * * *'     # UTC 每 30 分钟（:05 和 :35 各一次）
   workflow_dispatch:            # 允许在 Actions 页手动点 Run
   push:
     branches: [main]
@@ -38,19 +40,27 @@ jobs:
         id: gen
         working-directory: scripts
         run: |
-          LOG=$(python himawari_s3_cloud_map.py --latest --composite B13 --out ../assets/ir_latest.png 2>&1)
+          # --max-back-hours 12 确保即使遇到长时间网络延迟也能找到最新数据
+          LOG=$(python himawari_s3_cloud_map.py --latest --composite B13 --out ../assets/ir_latest.png --max-back-hours 12 2>&1)
           echo "$LOG" | tail -3
           TIME_UTC=$(echo "$LOG" | grep -oE '[0-9]{12}' | head -1)
-          echo "utc=$TIME_UTC" >> "$GITHUB_OUTPUT"
+          if [ -z "$TIME_UTC" ]; then
+            echo "utc=" >> "$GITHUB_OUTPUT"
+            echo "[WARN] IR 未探测到时次，跳过本轮更新"
+          else
+            echo "utc=$TIME_UTC" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Generate latest cloud-type image
         working-directory: scripts
         run: |
           T="${{ steps.gen.outputs.utc }}"
           if [ -n "$T" ]; then
+            echo "云分类基于 IR 时次: $T"
             python himawari_cloud_type.py --time "$T" --out ../assets/cloudtype_latest.png
           else
-            python himawari_cloud_type.py --latest --out ../assets/cloudtype_latest.png
+            echo "IR 时次为空，用 --latest 单独探测"
+            python himawari_cloud_type.py --latest --max-back-hours 12 --out ../assets/cloudtype_latest.png
           fi
 
       - name: Update observation timestamp in index.html
