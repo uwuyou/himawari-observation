@@ -82,7 +82,7 @@
     <div>
       <div class="kicker">Himawari-9 · 红外监测 · 实时云分类</div>
       <h1>东亚<span>&nbsp;</span><em>云图观测台</em></h1>
-      <div class="sub">基于葵花-9（Himawari-9/AHI）红外与微物理通道，自动生成最新红外云图与低/中/高云分类图。数据来源：NOAA 公共 AWS S3。</div>
+      <div class="sub">基于葵花-9（Himawari-9/AHI）红外与微物理通道，参考 JMA HCAI（高分辨率云分析信息）算法，自动生成最新红外云图与云分类图（8 种类型：晴空、层云/雾、层积云、积云、中云、深对流、卷云、层状高云）。数据来源：NOAA 公共 AWS S3。</div>
     </div>
     <div class="status">
       <div class="pill live">LIVE 自动更新</div>
@@ -101,7 +101,7 @@
         <div class="load-note">AWAITING FRAME</div>
         <img src="assets/ir_latest.png" alt="最新红外云图" loading="lazy">
       </div>
-      <div class="card-foot"><span class="mono">波段 B13 10.4µm 亮温</span><span class="mono" id="ir_time">--</span></div>
+      <div class="card-foot"><span class="mono">红外 B13 10.4µm 亮温</span><span class="mono" id="ir_time">--</span></div>
     </section>
 
     <section class="card">
@@ -113,15 +113,17 @@
         <div class="load-note">AWAITING FRAME</div>
         <img src="assets/cloudtype_latest.png" alt="最新云分类图" loading="lazy">
       </div>
-      <div class="card-foot"><span class="mono">低/中/深对流/卷/层状高云</span><span class="mono" id="ct_time">--</span></div>
+      <div class="card-foot"><span class="mono">参考 HCAI 分类 · 低云分 St/Sc/Cu</span><span class="mono" id="ct_time">--</span></div>
     </section>
   </div>
 
   <div class="legend">
     <span><i class="dot" style="background:#1f3d5e"></i>晴空</span>
-    <span><i class="dot" style="background:#21b06a"></i>低云</span>
+    <span><i class="dot" style="background:#8cbfc7"></i>层云/雾</span>
+    <span><i class="dot" style="background:#59a68c"></i>层积云</span>
+    <span><i class="dot" style="background:#21b06a"></i>积云</span>
     <span><i class="dot" style="background:#facb2c"></i>中云</span>
-    <span><i class="dot" style="background:#ffffff"></i>深对流</span>
+    <span><i class="dot" style="background:#ff3333"></i>深对流</span>
     <span><i class="dot" style="background:#bf8ff7"></i>卷云</span>
     <span><i class="dot" style="background:#8fcfe8"></i>层状高云</span>
   </div>

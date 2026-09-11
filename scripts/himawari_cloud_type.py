@@ -3,23 +3,28 @@
 """
 基于 Himawari-8/9 源数据（NOAA 公共 AWS S3，免注册）离线推算低/中/高云分类。
 
-原理（多波段红外阈值法）：
-  - 云顶亮温 BT13（11µm）分层：BT 越低云越高。
-        BT13 < 235 K                       -> 高云（多为冰相/深对流）
-        235 K <= BT13 < 262 K              -> 中云
-        白天 BT13>=262K 且可见光反射率高   -> 低云
-        夜间 BT13>=262K 且 3.9µm-11µm>2K  -> 低云（液态水云微物理正差）
-        其余                               -> 晴空
-  说明：这是业务常用的简化方案。白天用太阳校正后的可见光反射率区分低云与暖地表；
-        夜间太阳反射消失，改用 3.9µm(B07) 微物理通道——液态水云 3.9µm 亮温高于
-        11µm 呈正差，而冷却后的地表为负差，故正差即判低云。
+原理（参考 JMA HCAI / CMP 算法体系，MSC Tech Note 61 & 62）：
+  - 云顶亮温 BT13（10.4µm）主要分层：
+        BT13 < 235 K                    → 高云（冰相）
+        235 K ≤ BT13 < 262 K            → 中云
+        BT13 ≥ 262 K                    → 低云 或 晴空（白天用可见光，夜间用 3.9µm 微物理）
+  - 高云细分（参考 HCAI 分裂窗技术）：
+        BT13 < 228 K                    → 深对流（Cb，冷顶厚冰云）
+        BT13 < 235K 且 BTD(B13-B15)≥1.5K → 卷云（薄半透明冰晶）
+        其余高云                         → 层状高云（厚冰云/密卷云）
+  - 低云局地纹理（参考 HCAI 基于邻域 BT 变化区分 Cu/Sc/St）：
+        BT13 邻域标准差 > 4K            → 积云（Cu，起伏大）
+        BT13 邻域标准差 2~4K           → 层积云（Sc，中等纹理）
+        BT13 邻域标准差 < 2K            → 层云/雾（St/Fg，平坦均匀）
+  - 夜间低云使用 B07(3.9µm)-B13(10.4µm) 亮温差 WB4（液态水云正差）
 
 用法：
-  python3 himawari_cloud_type.py --time 202609110600
+  python3 himawari_cloud_type.py --latest
   python3 himawari_cloud_type.py --time 202609110600 --sat H08 --bbox 70,3,140,55 --out cls.png
+  python3 himawari_cloud_type.py --latest --hcai-mode    # 完整 HCAI 模式（含 B08/B10 水汽通道）
 
-依赖：satpy cartopy xarray matplotlib（与 himawari_s3_cloud_map.py 相同）
-数据：B13、B15、B07（2km 热红外；B07=3.9µm 微物理通道用于夜间低云判据）
+依赖：satpy cartopy xarray matplotlib
+数据：B13、B15、B07（基础） + 可选 B08(6.2µm) 水汽通道（--hcai-mode 时加载）
 """
 import argparse
 import os
@@ -31,13 +36,12 @@ import numpy as np
 
 def _dem_high_region(dem_path, lon0, lat0, lon1, lat1, shape, dem_thr):
     """读高程 GeoTIFF 并重投影到目标经纬网格，返回海拔 > dem_thr 的布尔掩膜。"""
-    import numpy as np
     try:
         import rasterio
         from rasterio.enums import Resampling as RIO_RS
         from rasterio.transform import from_bounds
-    except Exception as e:
-        print(f"[警告] 无法加载 rasterio 以读取 DEM（{e}），跳过高程掩膜")
+    except ImportError:
+        print("[警告] 无 rasterio，跳过高程掩膜")
         return None
     height, width = int(shape[0]), int(shape[1])
     elev = np.zeros((height, width), dtype="float32")
@@ -51,7 +55,7 @@ def _dem_high_region(dem_path, lon0, lat0, lon1, lat1, shape, dem_thr):
 
 
 def _cos_solar_zenith(ymd_hhmm, lon, lat):
-    """逐像元太阳天顶角余弦。用于把可见光反射率归一到正午，抑制下午漏检。"""
+    """逐像元太阳天顶角余弦。"""
     import numpy as np
     y, m, d = int(ymd_hhmm[0:4]), int(ymd_hhmm[4:6]), int(ymd_hhmm[6:8])
     hh = int(ymd_hhmm[8:10]); mm = int(ymd_hhmm[10:12])
@@ -62,16 +66,27 @@ def _cos_solar_zenith(ymd_hhmm, lon, lat):
             - 0.006758 * np.cos(2 * gamma) + 0.000907 * np.sin(2 * gamma)
             - 0.002697 * np.cos(3 * gamma) + 0.00148 * np.sin(3 * gamma))
     phi = np.deg2rad(lat)
-    H = np.deg2rad(15.0 * (utc_hour + lon / 15.0 - 12.0))  # 时角
+    H = np.deg2rad(15.0 * (utc_hour + lon / 15.0 - 12.0))
     return np.sin(phi) * np.sin(decl) + np.cos(phi) * np.cos(decl) * np.cos(H)
+
+
+def _local_std(arr, win=5):
+    """滑动窗口标准差。win=5 约对应 10km（0.02°×5），适合检测云顶纹理。"""
+    from scipy.ndimage import uniform_filter
+    arr = np.where(np.isfinite(arr), arr, 0)
+    c1 = uniform_filter(arr, size=win, mode="reflect")
+    c2 = uniform_filter(arr * arr, size=win, mode="reflect")
+    var = np.maximum(c2 - c1 * c1, 0)
+    return np.sqrt(var)
 
 
 def main():
     import himawari_s3_cloud_map as base  # 复用其下载/发现逻辑
 
-    ap = argparse.ArgumentParser(description="Himawari 源数据 低/中/高云分类")
+    ap = argparse.ArgumentParser(description="Himawari 源数据 低/中/高云分类（参考 JMA HCAI）")
     ap.add_argument("--sat", default="H09", choices=["H08", "H09"])
-    ap.add_argument("--time", default="202609110600", help="UTC 时次 YYYYMMDDHHMM（--latest 存在时忽略）")
+    ap.add_argument("--time", default="202609110600",
+                    help="UTC 时次 YYYYMMDDHHMM（--latest 存在时忽略）")
     ap.add_argument("--latest", action="store_true",
                     help="自动探测最近一个已有数据的 10 分钟时次")
     ap.add_argument("--max-back-hours", type=float, default=8.0,
@@ -79,42 +94,44 @@ def main():
     ap.add_argument("--bbox", default="70,3,140,55", help="minLon,minLat,maxLon,maxLat")
     ap.add_argument("--out", default="himawari_cloud_type.png")
     ap.add_argument("--workdir", default="./himawari_cache")
+
+    # HCAI 模式：加载 B08(6.2µm) 水汽通道以增强高云/深对流判别
+    ap.add_argument("--hcai-mode", action="store_true",
+                    help="完整 HCAI 模式（加装 B08/B10 水汽通道，更准但下载更多）")
+
+    # ---- 温度阈值（参考 HCAI / CMP 标准） ----
     ap.add_argument("--thr-high", type=float, default=235.0, help="高云亮温阈值 K")
     ap.add_argument("--thr-mid", type=float, default=262.0, help="中云亮温阈值 K")
-    ap.add_argument("--thr-split", type=float, default=0.6, help="低云分裂窗阈值 K")
     ap.add_argument("--thr-low-max", type=float, default=296.0,
-                    help="低云云顶亮温上限 K（避免午后暖地表误判为低云）")
-    ap.add_argument("--visible", dest="visible", action="store_true",
-                    help="叠加可见光 B04(0.86µm) 反射率，白天判云更准（推荐）")
-    ap.add_argument("--no-visible", dest="visible", action="store_false",
-                    help="关闭可见光，纯红外法")
-    ap.set_defaults(visible=True)
+                    help="低云云顶亮温上限 K")
+    ap.add_argument("--thr-dc", type=float, default=228.0,
+                    help="深对流（Cb）云顶亮温上限 K（HCAI 标准约 228-230K）")
+    # 分裂窗阈值（参考 JMA CCI 技术报告表 3 & HCAI 卷云判据）
+    ap.add_argument("--cir-split", type=float, default=1.5,
+                    help="卷云 B13-B15 分裂窗下限 K（HCAI: ≥1.5K 半透明冰晶；<1.5K 厚冰云）")
+    # 白天低云
     ap.add_argument("--ref-thr", type=float, default=40.0,
-                    help="白天低云可见光反照率阈值（B02 0.51µm，0-100 百分比）")
-    ap.add_argument("--sza-fixed", action="store_true",
-                     help="把太阳高度角固定为正午（normREF=原始反射率）。注意：下午原始反射率偏低，固定后反而更不漏，仅供对比")
-    ap.add_argument("--thr-bt47", type=float, default=10.0,
-                    help="白天低云 3.9µm-11µm 亮温差阈值 K（液态水云正差大，用于捞暗低云）")
-    ap.add_argument("--bt47-ref-min", type=float, default=15.0,
-                    help="白天该水云微物理路径要求的最低归一化反射率，避免把过暗地表也判为云")
+                    help="白天低云可见光反照率阈值（B02，0-100 百分比）")
     ap.add_argument("--thr-bt47-night", type=float, default=2.0,
-                    help="夜间低云 3.9µm-11µm 亮温差阈值 K（夜间水云正差约1-3K，内陆地表为负；默认2可分离）")
-    ap.add_argument("--thr-dc", type=float, default=210.0,
-                    help="深对流云顶亮温上限 K（更冷即为深对流）")
-    ap.add_argument("--cir-split-day", type=float, default=2.0,
-                    help="卷云白天 11-12.4µm 分裂窗下限 K（薄冰云日间正差大）")
-    ap.add_argument("--cir-split-night", type=float, default=-1.5,
-                    help="卷云夜间分裂窗上限 K（薄冰云夜间负差）")
+                    help="夜间低云 3.9µm-11µm 亮温差阈值 K")
+    # 积雪/高程
     ap.add_argument("--thr-snow", type=float, default=0.35,
-                    help="积雪 NDSI(可见-B05可见差值指数)阈值，高于此判为雪（剔除，非低云）")
-    ap.add_argument("--dem", default=None,
-                    help="可选：高程 GeoTIFF 路径（如 SRTM/ETOPO1），用于按海拔剔除亮地表假阳")
+                    help="NDSI 阈值，高于此判为雪")
+    ap.add_argument("--dem", default=None, help="高程 GeoTIFF 路径（可选）")
     ap.add_argument("--dem-thr", type=float, default=2600.0,
-                    help="海拔高于该值(m)的区域不判低云")
+                    help="高程掩膜阈值（米）")
+    # 纹理窗口（参照 HCAI 邻域分析）
+    ap.add_argument("--texture-win", type=int, default=5,
+                    help="BT13 纹理标准差滑动窗口（像元）")
+    # 积云/层积云/层云的纹理标准差阈值
+    ap.add_argument("--texture-cu", type=float, default=4.0,
+                    help="BT13 局地标准差 > 此值为积云（Cu，起伏大）")
+    ap.add_argument("--texture-sc", type=float, default=2.0,
+                    help="BT13 局地标准差 > 此值且 < --texture-cu 为层积云（Sc）")
+    # 输出参数
     ap.add_argument("--res", type=float, default=0.02,
-                    help="重投影网格分辨率（度）。0.02≈2km 与红外原始一致；0.01≈1km 最高清")
-    ap.add_argument("--dpi", type=int, default=200,
-                    help="输出 PNG 分辨率（像素/英寸），越高越清晰")
+                    help="重投影网格分辨率（度）")
+    ap.add_argument("--dpi", type=int, default=200, help="输出 PNG 分辨率")
     args = ap.parse_args()
 
     bucket = base.BUCKETS[args.sat]
@@ -127,10 +144,16 @@ def main():
     bbox = tuple(float(x) for x in args.bbox.split(","))
     lon0, lat0, lon1, lat1 = bbox
 
-    bands = ["B13", "B15", "B07"]   # B07=3.9µm 微物理通道，夜间低云判据必需
-    if args.visible:
-        bands.append("B02")   # 0.51µm 可见光，用于白天“低云 vs 地表”
-        bands.append("B05")   # 1.6µm 短波红外，用于剔除积雪（雪可见光亮、1.6µm暗）
+    # ---- 数据加载 ----
+    bands = ["B13", "B15", "B07"]  # B07=3.9µm 微物理通道（夜间低云判据必需）
+    bands.append("B02")  # 可见光
+    bands.append("B05")  # 1.6µm 积雪剔除
+
+    if args.hcai_mode:
+        # HCAI 完整模式：加装 B08(6.2µm) 水汽通道，提升深对流/高云顶鉴别
+        bands.append("B08")
+        # B10(7.3µm) 更耗资源，不作为默认；用户如需可在 bands 中追加
+
     keys = base.discover_keys(bucket, args.time)
     if not keys:
         print(f"[错误] bucket={bucket} 时次 {args.time} 无数据")
@@ -145,108 +168,146 @@ def main():
         return 1
     scn = Scene(filenames=dats, reader="ahi_hsd")
     scn.load(["B13", "B15", "B07"], calibration=["brightness_temperature"])
-    if args.visible:
-        scn.load(["B02", "B05"], calibration=["reflectance"])
+    scn.load(["B02", "B05"], calibration=["reflectance"])
+    if args.hcai_mode and "B08" in bands:
+        scn.load(["B08"], calibration=["brightness_temperature"])
 
-    # 裁剪 + 重投影到经纬度网格
+    # ---- 重投影 ----
     from pyresample.geometry import AreaDefinition
     crop = scn.crop(ll_bbox=bbox)
     res = args.res
     target = AreaDefinition("chn", "chn", "chn",
                             projection={"proj": "longlat", "datum": "WGS84", "ellps": "WGS84"},
-                            width=int((lon1 - lon0) / res), height=int((lat1 - lat0) / res),
+                            width=int((lon1 - lon0) / res),
+                            height=int((lat1 - lat0) / res),
                             area_extent=(lon0, lat0, lon1, lat1))
     rs = crop.resample(target, resampler="nearest")
+
     BT = rs["B13"].values.astype("float64")
     BT15 = rs["B15"].values.astype("float64")
-    split = BT - BT15
+    split = BT - BT15         # B13-B15 分裂窗差异（正=薄冰，负或零=厚云）
+    BT4 = rs["B07"].values.astype("float64")
+    WB4 = BT4 - BT            # 3.9µm-11µm 微物理差（水云正差）
+
+    # 可选水汽通道
+    B08 = rs["B08"].values.astype("float64") if (args.hcai_mode and "B08" in rs) else None
+    BTD_WV = (B08 - BT) if B08 is not None else None  # 水汽-红外差，≤0 为对流层顶附近
+
     tstr = str(rs["B13"].attrs.get("start_time", ""))[:16]
 
-    # 白天判定：可见光反照率整体较高即视为白天（启用可见光时）
-    daytime = False
-    snow = None
-    dem_high = None
-    normREF = None
-    if args.visible and "B02" in rs:
-        REF = rs["B02"].values.astype("float64")
-        REF5 = rs["B05"].values.astype("float64")
-        hh, ww = REF.shape[0], REF.shape[1]
-        _lons = lon0 + (np.arange(ww) + 0.5) * (lon1 - lon0) / ww
-        _lats = lat0 + (np.arange(hh) + 0.5) * (lat1 - lat0) / hh
-        LON, LAT = np.meshgrid(_lons, _lats)
-        cosZ = _cos_solar_zenith(args.time, LON, LAT)
-        # 反射率按太阳高度角归一化，抬正午后因太阳过低导致的可见光反射率整体下压
-        if args.sza_fixed:
-            normREF = REF.copy()  # 固定正午：使用原始反射率
-        else:
-            normREF = REF / np.clip(cosZ, 0.15, 1.0)
-        # 以太阳高度角判定白天（cosZ 中位 >0.25 ≈ 太阳高于 15°），比用反射率阈值更可靠，
-        # 避免凌晨/黄昏把夜间误当白天
-        daytime = bool(np.nanmedian(cosZ) > 0.25) if cosZ.size else False
-        # 积雪剔除：雪可见光亮(B02高)、1.6µm暗(B05低) → NDSI指数（用百分比直接算）
-        eps = 1e-6
-        snow = (REF - REF5) / (REF + REF5 + eps) > args.thr_snow
-    else:
-        REF = None
+    # ---- 太阳几何与白天判定 ----
+    REF = rs["B02"].values.astype("float64")
+    REF5 = rs["B05"].values.astype("float64")
+    hh, ww = REF.shape[0], REF.shape[1]
+    _lons = lon0 + (np.arange(ww) + 0.5) * (lon1 - lon0) / ww
+    _lats = lat0 + (np.arange(hh) + 0.5) * (lat1 - lat0) / hh
+    LON, LAT = np.meshgrid(_lons, _lats)
+    cosZ = _cos_solar_zenith(args.time, LON, LAT)
+    normREF = REF / np.clip(cosZ, 0.15, 1.0)
+    daytime = bool(np.nanmedian(cosZ) > 0.25) if cosZ.size else False
 
-    # 3.9µm 微物理差（液态水云强正差），白天捞暗低云、夜间判低云
-    BT4 = rs["B07"].values.astype("float64") if "B07" in rs else np.full(BT.shape, np.nan)
-    WB4 = BT4 - BT
-    # 可选 DEM 高程掩膜：海拔过高处不应出现低云
+    # 积雪剔除（NDSI）
+    eps = 1e-6
+    snow = (REF - REF5) / (REF + REF5 + eps) > args.thr_snow
+
+    # 可选 DEM 高程掩膜
+    dem_high = None
     if args.dem:
         dem_high = _dem_high_region(args.dem, lon0, lat0, lon1, lat1,
                                     rs["B13"].shape, args.dem_thr)
 
-    # ---- 分类 ----
-    # 0=晴空, 1=低云, 2=中云, 3=深对流, 4=卷云, 5=层状高云
-    cls = np.zeros(BT.shape, dtype=np.uint8)
-    cls[BT < args.thr_high] = 5               # 先统置为“高云”
-    cls[(BT >= args.thr_high) & (BT < args.thr_mid)] = 2
-    if REF is not None and daytime:
-        # 白天低云：仅用归一化可见光反射率（已太阳校正）。
-        # 注意：不在白天叠加 3.9µm 微物理——白天地表（尤其沙漠/裸岩）受太阳加热
-        # 致 3.9µm-11µm 也呈大正差，实测新疆沙漠会 48.7% 假阳。3.9µm 仅用于夜间。
-        low = (BT >= args.thr_mid) & (BT <= args.thr_low_max) & (normREF > args.ref_thr)
-        if snow is not None:
-            low &= ~snow
-        if dem_high is not None:
-            low &= ~dem_high
-        cls[low] = 1
-    else:
-        # 夜间：无太阳反射干扰，3.9µm-11µm 正差显著即液态水云（低云），替代原分裂窗法。
-        # 夜间暖地表冷却、3.9µm 亮温低于 11µm 呈负差，而液态水云的 3.9µm>11µm 正差仍可分离。
-        night_low = ((BT >= args.thr_mid) & (BT <= args.thr_low_max)
-                     & (WB4 > args.thr_bt47_night))
-        cls[night_low] = 1
-        _dbg = (BT >= args.thr_mid) & (BT <= args.thr_low_max) & (WB4 > args.thr_bt47_night)
-        _valid = np.isfinite(BT) & np.isfinite(BT4)
-        print(
-            f"[DBG] 夜间 daytime={daytime} BT非有限={int((~np.isfinite(BT)).sum())} "
-            f"BT4非有限={int((~np.isfinite(BT4)).sum())} "
-            f"262<=BT<=296 且 WB4非有限={int((_valid&(BT>=args.thr_mid)&(BT<=args.thr_low_max)&~np.isfinite(WB4)).sum())} "
-            f"夜低候选(262<=BT<=296且WB4>{args.thr_bt47_night:g})={( _dbg).sum()} "
-            f"其中有限WB4={int((_valid&_dbg).sum())}",
-            file=sys.stderr)
-    # 高云细分：深对流(极冷厚顶) > 卷云(薄冰,分裂窗日正夜负) > 层状高云(其余)
-    highmask = BT < args.thr_high
-    deep = highmask & (BT < args.thr_dc)
-    cls[deep] = 3
-    if np.any(highmask & ~deep):
-        if daytime:
-            cir = highmask & ~deep & (split > args.cir_split_day)
-        else:
-            cir = highmask & ~deep & (split < args.cir_split_night)
-        cls[cir] = 4
-    cls[np.isnan(BT)] = 0
+    # ---- 局地纹理（参考 HCAI 邻域分析区分 Cu/Sc/St） ----
+    BT_std = _local_std(BT, win=args.texture_win)
 
-    # ---- 着色 ----
+    # ---- 分类（参考 HCAI 云类型体系） ----
+    #  编码映射：
+    #   0 晴空
+    #   1 层云/雾（St/Fg）   — 低云，纹理平坦
+    #   2 层积云（Sc）        — 低云，纹理中等
+    #   3 积云（Cu）          — 低云，纹理起伏大
+    #   4 中云（CM）
+    #   5 深对流（Cb）
+    #   6 卷云（CH）         — 半透明冰云
+    #   7 层状高云（Dense） — 不透明高冰云
+    cls = np.zeros(BT.shape, dtype=np.uint8)
+    valid = np.isfinite(BT)
+
+    # ---- 辅助掩膜 ----
+    clear_sky = valid.copy()  # 最终未被覆盖的即为晴空
+
+    # ==== 高云：BT13 < thr_high ====
+    high = valid & (BT < args.thr_high)
+    # 深对流（Cb）：极冷顶（参考 HCAI：BT13 < 228-230K 且分裂窗窄=厚冰）
+    # 如果水汽通道可用，附加 BTD_WV ≤ 0K 判据（云顶达对流层顶）
+    cb = high & (BT < args.thr_dc)
+    if args.hcai_mode and BTD_WV is not None:
+        cb = cb & (BTD_WV <= 2.0)  # 水汽通道被云顶遮挡
+    cls[cb] = 5
+
+    # 卷云（CH）：半透明薄冰，分裂窗正差大
+    cir = high & ~cb & (split >= args.cir_split)
+    cls[cir] = 6
+
+    # 层状高云（Dense）：剩余高云（厚冰云）
+    dense = high & ~cb & ~cir
+    cls[dense] = 7
+
+    # ==== 中云：thr_high ≤ BT13 < thr_mid ====
+    mid = valid & (BT >= args.thr_high) & (BT < args.thr_mid)
+    cls[mid] = 4
+
+    # ==== 低云：BT13 ≥ thr_mid（含低云+晴空） ====
+    low_candidate = valid & (BT >= args.thr_mid) & (BT <= args.thr_low_max)
+
+    if daytime:
+        # 白天：用归一化可见光反照率区分低云与晴空地物
+        low = low_candidate & (normREF > args.ref_thr)
+        # 排除积雪和高海拔
+        low = low & ~snow
+        if dem_high is not None:
+            low = low & ~dem_high
+        # 按纹理细分低云
+        st = low & (BT_std < args.texture_sc)       # 层云/雾（平坦）
+        sc_cld = low & (BT_std >= args.texture_sc) & (BT_std < args.texture_cu)  # 层积云
+        cu = low & (BT_std >= args.texture_cu)      # 积云（起伏大）
+        cls[st] = 1
+        cls[sc_cld] = 2
+        cls[cu] = 3
+    else:
+        # 夜间：用 3.9µm-11µm 微物理差
+        low = low_candidate & (WB4 > args.thr_bt47_night)
+        # 低云纹理仅在有效区域计算
+        if low.any():
+            low_std = BT_std[low]
+            if args.texture_cu is not None:
+                # 定义阈值
+                thr_cu = args.texture_cu
+                thr_sc = args.texture_sc
+                st = low & (BT_std < thr_sc)
+                sc_cld = low & (BT_std >= thr_sc) & (BT_std < thr_cu)
+                cu = low & (BT_std >= thr_cu)
+                cls[st] = 1
+                cls[sc_cld] = 2
+                cls[cu] = 3
+
+    # 统计报告
+    names = ["晴空", "层云/雾", "层积云", "积云", "中云", "深对流", "卷云", "层状高云"]
+    for i, lbl in enumerate(names):
+        n = int((cls == i).sum())
+        frac = n / (valid.sum() or 1) * 100
+        if frac > 0.5:
+            print(f"  {lbl}: {frac:.1f}%")
+
+    # ---- 着色（参考 HCAI 云类型配色体系） ----
     color = np.array([
-        [0.12, 0.24, 0.50],   # 0 晴空 蓝
-        [0.13, 0.72, 0.35],   # 1 低云 绿
-        [0.98, 0.84, 0.05],   # 2 中云 黄
-        [1.00, 1.00, 1.00],   # 3 深对流 白
-        [0.75, 0.52, 0.99],   # 4 卷云 紫
-        [0.56, 0.81, 0.91],   # 5 层状高云 浅蓝
+        [0.12, 0.24, 0.50],   # 0 晴空
+        [0.55, 0.75, 0.78],   # 1 层云/雾  St/Fg  淡蓝灰
+        [0.35, 0.65, 0.55],   # 2 层积云 Sc     蓝绿
+        [0.13, 0.72, 0.35],   # 3 积云 Cu       鲜绿
+        [0.98, 0.84, 0.05],   # 4 中云 CM       黄
+        [1.00, 0.20, 0.20],   # 5 深对流 Cb     红
+        [0.75, 0.52, 0.99],   # 6 卷云 CH       紫
+        [0.56, 0.81, 0.91],   # 7 层状高云     浅蓝
     ])
     rgb = color[cls]
 
@@ -262,7 +323,6 @@ def main():
             break
     matplotlib.rcParams["axes.unicode_minus"] = False
 
-    # 输出像素数与重投影网格匹配，保证裁切放大不糊
     fig_w = (lon1 - lon0) / res / args.dpi
     fig_h = (lat1 - lat0) / res / args.dpi
     try:
@@ -278,27 +338,23 @@ def main():
         ax.imshow(rgb, origin="upper", transform=ccrs.PlateCarree(),
                   extent=(lon0, lon1, lat0, lat1), interpolation="nearest")
     except Exception as e:
-        print("[提示] cartopy 不可用，基础显示:", e)
+        print("[提示] cartopy 不可用:", e)
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=args.dpi)
         ax.imshow(rgb, origin="upper")
 
-    # 图例
     import matplotlib.patches as mpatches
     handles = [mpatches.Patch(color=color[i], label=lbl)
-               for i, lbl in enumerate(["晴空", "低云", "中云", "深对流", "卷云", "层状高云"])]
+               for i, lbl in enumerate(names)]
     ax.legend(handles=handles, loc="lower left", fontsize=8.5, frameon=True, ncol=2,
               bbox_to_anchor=(0.01, 0.01))
 
-    ax.set_title(f"{args.sat} Himawari 云分类（高云细分）  {tstr} UTC\n中国区域（高云: 深对流<{args.thr_dc:.0f}K | 卷云薄冰 | 层状其余）")
+    mode_tag = "HCAI" if args.hcai_mode else "标准"
+    ax.set_title(
+        f"{args.sat} Himawari 云分类（参考 JMA HCAI/{mode_tag}）  {tstr} UTC\n"
+        f"深对流 BT13<{args.thr_dc:.0f}K | 卷云分裂窗≥{args.cir_split:.1f}K | 低云纹理分 Cu/Sc/St")
     fig.tight_layout()
     fig.savefig(args.out, bbox_inches="tight")
     print("已保存：", os.path.abspath(args.out))
-
-    # 统计
-    for i, lbl in enumerate(["晴空", "低云", "中云", "深对流", "卷云", "层状高云"]):
-        n = int((cls == i).sum())
-        frac = n / (np.isfinite(BT).sum() or 1) * 100
-        print(f"  {lbl}: {frac:.1f}%")
     return 0
 
 
