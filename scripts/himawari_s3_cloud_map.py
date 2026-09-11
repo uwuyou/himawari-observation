@@ -199,7 +199,13 @@ def plot(scene, composite, bbox, out, sat, res=0.02, dpi=200):
             mn, mx = np.percentile(v, [lo, hi])
             if mx - mn < 1e-6:
                 mx = mn + 1.0
-            return np.clip((ch - mn) / (mx - mn), 0, 1)
+            out = np.clip((ch - mn) / (mx - mn), 0, 1)
+            # 用中位数填充 NaN 像素
+            med = np.nanmedian(out)
+            if not np.isfinite(med):
+                med = 0.5
+            out[~np.isfinite(out)] = med
+            return out
         arr = np.stack([_stretch(R, 2, 98), _stretch(G, 2, 98), _stretch(B, 0, 100)], axis=0)
         tstr = str(rs["B13"].attrs.get("start_time", ""))[:16]
         data = rs["B13"]  # 仅用于 tstr
@@ -237,7 +243,11 @@ def _render(ax, arr, bbox, ext, is_ir=False):
     """公共绘图：RGB 真彩 or 单通道（红外/可见光）增强图。"""
     if arr.ndim == 3 and arr.shape[0] == 3:
         img = arr.transpose(1, 2, 0)
-        img = (img - img.min()) / (img.max() - img.min() + 1e-9)
+        lo, hi = np.nanmin(img), np.nanmax(img)
+        if hi - lo < 1e-9:
+            hi = lo + 1.0
+        img = np.clip((img - lo) / (hi - lo), 0, 1)
+        img[~np.isfinite(img)] = 0.0
         kwargs = dict(transform=ax.projection, origin="upper",
                       interpolation="nearest") if ext else dict(origin="upper")
         if ext:
