@@ -16,15 +16,19 @@
         BT13 邻域标准差 > 4K            → 积云（Cu，起伏大）
         BT13 邻域标准差 2~4K           → 层积云（Sc，中等纹理）
         BT13 邻域标准差 < 2K            → 层云/雾（St/Fg，平坦均匀）
-  - 夜间低云使用 B07(3.9µm)-B13(10.4µm) 亮温差 WB4（液态水云正差）
+  - 夜间低云使用 B07(3.9µm)-B13(10.4µm) 亮温差 WB4（液态水云正差），
+    并融入 Night Microphysics RGB 三维判据（JMA 雾监测技术文档）：
+    分裂窗 B13-B15 ≈ 0（光学厚水云→层云/雾）vs 偏差大（层积云）
+    配合 BT13 局地纹理区分积云
 
 用法：
   python3 himawari_cloud_type.py --latest
   python3 himawari_cloud_type.py --time 202609110600 --sat H08 --bbox 70,3,140,55 --out cls.png
   python3 himawari_cloud_type.py --latest --hcai-mode    # 完整 HCAI 模式（含 B08/B10 水汽通道）
 
-依赖：satpy cartopy xarray matplotlib
-数据：B13、B15、B07（基础） + 可选 B08(6.2µm) 水汽通道（--hcai-mode 时加载）
+依赖：satpy cartopy xarray matplotlib scipy
+数据：B13(10.4µm)、B15(12.4µm)、B07(3.9µm) + B02(0.51µm)/B05(1.6µm)（白天积雪剔除）
+     B14(11.2µm) 可选（Night Microphysics 增强）
 """
 import argparse
 import os
@@ -274,21 +278,29 @@ def main():
         cls[sc_cld] = 2
         cls[cu] = 3
     else:
-        # 夜间：用 3.9µm-11µm 微物理差
+        # 夜间：Night Microphysics 三维判据（参考 JMA 雾监测技术文档）
+        #   WB4 = B07-B13 > 2K → 液态水低云（核心判据）
+        #   SW  = B13-B15 分裂窗 → 光学厚度判据：
+        #      |SW| < 1.5K → 光学厚水云（层云/雾，两个红外通道几乎同温）
+        #      SW 偏差大 → 光学薄或混合相（层积云）
+        #   再配合 BT13 局地纹理区分积云（高起伏）
         low = low_candidate & (WB4 > args.thr_bt47_night)
-        # 低云纹理仅在有效区域计算
         if low.any():
-            low_std = BT_std[low]
-            if args.texture_cu is not None:
-                # 定义阈值
-                thr_cu = args.texture_cu
-                thr_sc = args.texture_sc
-                st = low & (BT_std < thr_sc)
-                sc_cld = low & (BT_std >= thr_sc) & (BT_std < thr_cu)
-                cu = low & (BT_std >= thr_cu)
-                cls[st] = 1
-                cls[sc_cld] = 2
-                cls[cu] = 3
+            SW = split  # B13-B15
+            # 积云：高纹理（无论分裂窗值）
+            cu = low & (BT_std >= args.texture_cu)
+            # 剩余低云中，用分裂窗分离层云/雾 vs 层积云
+            rest = low & ~cu
+            # 层云/雾：光学厚水云，分裂窗近零
+            st = rest & (np.abs(SW) < 1.5)
+            # 层积云：分裂窗偏差较大
+            sc_cld = rest & ~st
+            cls[st] = 1
+            cls[sc_cld] = 2
+            cls[cu] = 3
+            print(f"[NM] 夜间低云: St={int(st.sum())} Sc={int(sc_cld.sum())} Cu={int(cu.sum())} | "
+                  f"WB4中位={np.nanmedian(WB4[low]):.1f}K SW中位={np.nanmedian(SW[low]):.1f}K",
+                  file=sys.stderr)
 
     # 统计报告
     names = ["晴空", "层云/雾", "层积云", "积云", "中云", "深对流", "卷云", "层状高云"]

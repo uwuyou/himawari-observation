@@ -37,7 +37,7 @@ COMPOSITE_BANDS = {
     "true_color": ["B01", "B02", "B03"],
     "natural_color": ["B05", "B07", "B11"],
     "overview": ["B01", "B02", "B03", "B05", "B07", "B11"],
-    "night_microphysics": ["B07", "B13", "B14", "B15"],   # 夜间微物理 RGB：可识别夜间低云/雾/冰水相态
+    "night_microphysics": ["B07", "B13", "B15"],   # 夜间微物理 RGB：R=BTD(B15-B13) G=BTD(B13-B07) B=BT13（JMA 雾监测）
 }
 USER_AGENT = "Mozilla/5.0 fog-aws-cli"
 CHINA_BBOX = (70, 3, 140, 55)
@@ -153,7 +153,11 @@ def plot(scene, composite, bbox, out, sat, res=0.02, dpi=200):
 
     # 热红外波段（B07-B16）用亮温增强渲染，冷云顶=亮白、暖地表=深灰
     is_ir = bool(re.fullmatch(r"B(0[7-9]|1[0-6])", composite))
-    if is_ir:
+    is_night_micro = (composite == "night_microphysics")
+    if is_night_micro:
+        # JMA 式 Night Microphysics RGB：R=BTD(B15-B13) G=BTD(B13-B07) B=BT13
+        scene.load(["B07", "B13", "B15"], calibration=["brightness_temperature"])
+    elif is_ir:
         scene.load([composite], calibration=["brightness_temperature"])
     else:
         scene.load([composite])
@@ -172,9 +176,31 @@ def plot(scene, composite, bbox, out, sat, res=0.02, dpi=200):
         area_extent=(lon0, lat0, lon1, lat1),
     )
     rs = crop_scene.resample(target, resampler="nearest")
-    data = rs[composite]
-    arr = data.values
-    tstr = str(data.attrs.get("start_time", ""))[:16]
+
+    if is_night_micro:
+        # JMA Night Microphysics RGB：R=BTD(B15-B13) G=BTD(B13-B07) B=BT13
+        BT13 = rs["B13"].values.astype("float64")
+        BT07 = rs["B07"].values.astype("float64")
+        BT15 = rs["B15"].values.astype("float64")
+        R = BT15 - BT13           # BTD(B15-B13)
+        G = BT13 - BT07           # BTD(B13-B07)  = -WB4
+        B = BT13
+        # 各通道采用百分位拉伸，自适应范围
+        def _stretch(ch, lo=2, hi=98):
+            v = ch[np.isfinite(ch)]
+            if v.size == 0:
+                return np.full_like(ch, 0.5)
+            mn, mx = np.percentile(v, [lo, hi])
+            if mx - mn < 1e-6:
+                mx = mn + 1.0
+            return np.clip((ch - mn) / (mx - mn), 0, 1)
+        arr = np.stack([_stretch(R, 2, 98), _stretch(G, 2, 98), _stretch(B, 0, 100)], axis=0)
+        tstr = str(rs["B13"].attrs.get("start_time", ""))[:16]
+        data = rs["B13"]  # 仅用于 tstr
+    else:
+        data = rs[composite]
+        arr = data.values
+        tstr = str(data.attrs.get("start_time", ""))[:16]
     ext = (lon0, lon1, lat0, lat1)
 
     # figsize 使输出像素数与遥感网格基本一致，保证裁切放大细节不丢
