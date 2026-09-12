@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=https://schema.zeabur.app/template.json
+# Zeabur Template Resource —— Himawari-9 实时云数据处理 Worker
+#
+# 用途：在 Zeabur 控制台用「从 YAML 创建模板 / 导入」部署时使用。
+# 也可以仅作为配置参考；最直接的构建识别仍由仓库根目录的 zbpack.json 完成：
+#   zbpack.json = { "dockerfile": { "path": "zeabur/Dockerfile" } }
+#   它会让 Zeabur 用 zeabur/Dockerfile 以 Docker 方式构建，而不是误判为静态站。
+#
+# 部署后需在服务「环境变量」里设置：
+#   GITHUB_TOKEN  (必填，用于 clone + push 仓库的 PAT)
+#   GITHUB_REPO   (默认 uwuyou/himawari-observation)
+#   SCHED_MINUTES (默认 30)
+#   CITY_NAME / CITY_LAT / CITY_LON (火烧云预测城市，默认 上海 31.23 121.47)
+
+apiVersion: zeabur.com/v1
+kind: Template
+metadata:
+  name: himawari-worker
+spec:
+  description: |
+    常驻 Worker，每 30 分钟从 NOAA AWS S3 拉取 Himawari-9 数据，
+    生成红外云图、云分类图、夜间微物理合成图和火烧云预测，
+    并把结果 git 直推回 GitHub 仓库（GitHub Pages 自动出图）。
+  icon: https://raw.githubusercontent.com/zeabur/service-icons/main/marketplace/docker.svg
+  services:
+    - name: himawari-worker
+      icon: https://raw.githubusercontent.com/zeabur/service-icons/main/marketplace/docker.svg
+      template: PREBUILT_V2
+      spec:
+        ports:
+          - id: web
+            port: 8080
+            type: HTTP
+        env:
+          GITHUB_REPO:
+            default: uwuyou/himawari-observation
+          SCHED_MINUTES:
+            default: "30"
+          CITY_NAME:
+            default: 上海
+          CITY_LAT:
+            default: "31.23"
+          CITY_LON:
+            default: "121.47"
