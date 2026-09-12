@@ -392,9 +392,15 @@
         let az = (Math.atan2(-dlat, dlon) * 180/Math.PI + 270) % 360;
         let inAz = (azMin <= azMax) ? (az >= azMin && az <= azMax) : (az >= azMin || az <= azMax);
         if (!inAz) continue;
-        
+
         const idx = r * nx + c;
         const ct = fcCloudArr[idx];
+        // 光线能否照射到云底：观测者到云边水平距离须 ≤ √(2·R·h)，
+        // 否则阳光被地球曲率遮住、低云很快超出可照范围，直接剔除该云像素。
+        if (ct > 0) {
+          const h = CLOUD_HEIGHTS_JS[ct];
+          if (h == null || dist > Math.sqrt(2 * REARTH * h)) continue;
+        }
         totalPixels++;
         if (ct > 0) cloudPixels++;
         typeCounts[ct] = (typeCounts[ct] || 0) + 1;

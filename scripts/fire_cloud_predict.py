@@ -298,7 +298,20 @@ def predict(lat, lon, cls, LON, LAT, obs_time_utc, name=None):
         in_az = (az_to_pixel >= az_min) | (az_to_pixel <= az_max)
 
     in_range = (dist_km >= min_dist_km) & (dist_km <= max_dist_km)
-    roi = in_az & in_range & np.isfinite(cls)
+
+    # 4.4 光线能否照射到本地云底（几何可见性）
+    #     日出/日落时阳光为掠射角。观测者到云边的水平距离须 ≤ √(2·R·h)，
+    #     否则阳光被地球曲率遮住、云底收不到光（参考《火烧云定量预报》4.1.1）。
+    #     不同云类云底高度不同 → 最大可照亮水平距离不同；低云很快超出可照范围。
+    h_pix = np.zeros(cls.shape, dtype=np.float64)
+    for _ct, _h in CLOUD_BASE_HEIGHTS.items():
+        if _h is not None:
+            h_pix[cls == _ct] = _h
+    d_max_km = np.sqrt(2.0 * R_EARTH * np.maximum(h_pix, 0.0))
+    is_cloud_pix = cls > 0
+    lit_or_clear = (~is_cloud_pix) | (dist_km <= d_max_km)  # 晴空保留作分母，照不到的云剔除
+
+    roi = in_az & in_range & lit_or_clear & np.isfinite(cls)
 
     # 如果没有有效 ROI 区域
     if not roi.any():
