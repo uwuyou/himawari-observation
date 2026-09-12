@@ -505,7 +505,7 @@
     const az = (Math.atan2(E,N)*180/Math.PI + 360) % 360;
     const hh = Math.floor(sunsetUtc), mm2 = Math.floor((sunsetUtc - hh)*60);
     const utcStr = yyyymmdd + String(hh).padStart(2,'0') + String(mm2).padStart(2,'0');
-    return { sunsetUtc: utcStr, sunsetAz: az };
+    return { sunUtc: utcStr, sunAz: az };
   }
 
   function calcSunrise(lat, lon, yyyymmdd) {
