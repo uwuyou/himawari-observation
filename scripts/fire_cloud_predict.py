@@ -21,6 +21,7 @@
 """
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -409,6 +410,18 @@ def _empty_result(lat, lon, name, sunset_utc_str, sunset_az, reason):
     return result
 
 
+def _downsample_cloud(cls, factor=5):
+    """将云分类数组按因子降采样（取众数），加速从 0.02°→0.1°。"""
+    from scipy.stats import mode as sp_mode
+    h, w = cls.shape
+    h_new, w_new = h // factor, w // factor
+    crop = cls[:h_new * factor, :w_new * factor]
+    blocks = crop.reshape(h_new, factor, w_new, factor)
+    blocks = blocks.transpose(0, 2, 1, 3).reshape(h_new, w_new, -1)
+    result, _ = sp_mode(blocks, axis=2, keepdims=True)
+    return result[:, :, 0].astype(np.uint8)
+
+
 def main():
     ap = argparse.ArgumentParser(description="火烧云定量预测（基于 Himawari 云分类）")
     ap.add_argument("--lat", type=float, default=31.23, help="纬度（度，北正）")
@@ -420,6 +433,8 @@ def main():
     ap.add_argument("--sat", default="H09", choices=["H08", "H09"])
     ap.add_argument("--json", default=None, help="输出 JSON 文件路径（供网站使用）")
     ap.add_argument("--out", default=None, help="输出文本报告路径")
+    ap.add_argument("--export-cloud-json", default=None,
+                    help="导出降采样后的云分类数据为 JSON（供网站客户端查询任意城市）")
     args = ap.parse_args()
 
     # 1. 导入分类模块
@@ -483,6 +498,30 @@ def main():
     tstr = str(rs["B13"].attrs.get("start_time", ""))[:16]
 
     cls, daytime, LON, LAT, BT = ct_mod.classify_scene(rs, fake_args, tstr)
+
+    # 4b. 导出降采样后的云分类数据（供网站客户端任意城市查询）
+    if args.export_cloud_json:
+        factor = 5  # 0.02° → 0.1°
+        cls_low = _downsample_cloud(cls, factor)
+        h_low, w_low = cls_low.shape
+        # 经纬度网格
+        n_lons = np.linspace(bbox[0] + 0.1 / 2, bbox[2] - 0.1 / 2, w_low) if w_low > 0 else []
+        n_lats = np.linspace(bbox[3] - 0.1 / 2, bbox[1] + 0.1 / 2, h_low) if h_low > 0 else []
+        cloud_str = "".join(str(int(v)) for v in cls_low.ravel())
+        cloud_data = {
+            "bbox": list(bbox),
+            "res": 0.1,
+            "utc": args.time,
+            "nx": w_low,
+            "ny": h_low,
+            "lons": [round(float(v), 4) for v in n_lons],
+            "lats": [round(float(v), 4) for v in n_lats],
+            "data": cloud_str,
+        }
+        os.makedirs(os.path.dirname(args.export_cloud_json) if os.path.dirname(args.export_cloud_json) else ".", exist_ok=True)
+        with open(args.export_cloud_json, "w", encoding="utf-8") as f:
+            json.dump(cloud_data, f, ensure_ascii=False, separators=(",", ":"))
+        print(f"云数据已导出: {os.path.abspath(args.export_cloud_json)} ({len(cloud_str)//1024}KB)", file=sys.stderr)
 
     # 5. 运行预测
     result = predict(args.lat, args.lon, cls, LON, LAT, args.time, name=args.name)

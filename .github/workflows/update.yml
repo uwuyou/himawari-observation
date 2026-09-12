@@ -39,10 +39,15 @@ jobs:
       - name: Generate latest IR image (and detect obs time)
         id: gen
         working-directory: scripts
+        shell: bash
         run: |
+          set +e
           # --max-back-hours 12 确保即使遇到长时间网络延迟也能找到最新数据
           LOG=$(python himawari_s3_cloud_map.py --latest --composite B13 --out ../assets/ir_latest.png --max-back-hours 12 2>&1)
-          echo "$LOG" | tail -3
+          RC=$?
+          set -e
+          echo "exit_code=$RC"
+          echo "$LOG"
           TIME_UTC=$(echo "$LOG" | grep -oE '[0-9]{12}' | head -1)
           if [ -z "$TIME_UTC" ]; then
             echo "utc=" >> "$GITHUB_OUTPUT"
