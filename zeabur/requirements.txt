@@ -1,0 +1,13 @@
+flask>=3.0
+apscheduler>=3.10
+numpy>=1.24
+scipy>=1.10
+xarray>=2023.6
+satpy>=0.44
+pyresample>=1.26
+cartopy>=0.22
+matplotlib>=3.7
+netCDF4>=1.6
+pillow>=10.0
+requests>=2.31
+boto3>=1.34
