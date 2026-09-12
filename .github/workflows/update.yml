@@ -2,10 +2,11 @@ name: Update Himawari Cloud Images
 
 # 每小时的固定时间运行；也支持手动触发和 push 触发。
 # NOAA 每 10 分钟生成一个时次，上传到 AWS S3 约滞后 1-3 小时。
-# 每 15 分钟触发一次，能在新数据到达后 ~7 分钟内捕捉到并更新网站。
+# 每 30 分钟触发一次。GitHub 会对过高频率的定时工作流做节流/合并，
+# 频率降到每 30 分钟可明显降低被抑制导致的停更概率。
 on:
   schedule:
-    - cron: '0,15,30,45 * * * *'   # UTC 每 15 分钟一次
+    - cron: '0,30 * * * *'   # UTC 每小时 0 分、30 分各一次
   workflow_dispatch:            # 允许在 Actions 页手动点 Run
   push:
     branches: [main]
