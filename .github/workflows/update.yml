@@ -36,6 +36,12 @@ jobs:
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet satpy cartopy xarray matplotlib scipy requests
 
+      - name: Install CJK fonts for Chinese labels on cloud maps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+          rm -rf ~/.cache/matplotlib
+
       - name: Generate latest IR image (and detect obs time)
         id: gen
         working-directory: scripts
