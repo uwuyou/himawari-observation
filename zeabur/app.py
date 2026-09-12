@@ -41,7 +41,7 @@ import subprocess
 import sys
 import time
 
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, send_file, request
 from werkzeug.utils import safe_join
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -64,6 +64,14 @@ CITY_NAME = os.environ.get("CITY_NAME", "上海").strip() or "上海"
 CITY_LAT = os.environ.get("CITY_LAT", "31.23")
 CITY_LON = os.environ.get("CITY_LON", "121.47")
 PORT = int(os.environ.get("PORT", "8080"))
+
+# 上传发布：本地/常驻机器将渲染产物 POST 到 /api/upload，需带此 token。
+# 只有设置了 UPLOAD_TOKEN，上传接口才生效；否则一律 403。
+UPLOAD_TOKEN = os.environ.get("UPLOAD_TOKEN", "").strip()
+
+# 是否在 Pod 内也自行渲染卫星图（重型，吃内存，默认关闭）。
+# 关闭后容器只负责：托管静态站 + 接收 /api/upload 写入产物，2GB 绰绰有余。
+RENDER_IN_POD = os.environ.get("RENDER_IN_POD", "0").strip().lower() in ("1", "true", "yes")
 
 OBS_FILE = os.path.join(ASSETS_DIR, "obs_time.json")
 PY = sys.executable
@@ -248,13 +256,55 @@ def status():
 
 @app.route("/api/update", methods=["POST"])
 def manual_update():
-    """手动触发一轮刷新（调试用）。"""
+    """手动触发一轮刷新（仅调试用，且需 RENDER_IN_POD=1 才有意义）。"""
+    if not RENDER_IN_POD:
+        return jsonify(status="disabled", reason="RENDER_IN_POD=0，容器不渲染；请用常驻机器上传产物"), 403
     import threading
     threading.Thread(target=run_update, daemon=True).start()
     return jsonify(status="triggered")
 
 
+@app.route("/api/upload", methods=["POST"])
+def upload_asset():
+    """常驻渲染机器把产物文件 POST 到此，写入 /data/assets。
+
+    上传需带 `token`（查参或 X-Upload-Token 头），等于 Zeabur 环境变量 UPLOAD_TOKEN。
+    文件名仅允许已知产物名，防止路径穿越。失败时 500，理论上读回最新文件。
+    """
+    if not UPLOAD_TOKEN:
+        return jsonify(status="error", reason="未配置 UPLOAD_TOKEN，上传接口已禁用"), 403
+    tok = request.values.get("token", "") or request.headers.get("X-Upload-Token", "")
+    if tok != UPLOAD_TOKEN:
+        return jsonify(status="error", reason="token 错误"), 403
+
+    f = request.files.get("file")
+    if f is None:
+        return jsonify(status="error", reason="缺少 file 字段（multipart）"), 400
+    name = os.path.basename(f.filename or "")
+    if not name:
+        return jsonify(status="error", reason="文件名非法"), 400
+    # 只允许发布白名单产物，避免覆盖 index.html / app.py 等
+    allowed = {"ir_latest.png", "cloudtype_latest.png", "night_microphysics_latest.png",
+               "fire_prediction.json", "cloud_data.json", "obs_time.json"}
+    if name not in allowed:
+        return jsonify(status="error", reason="文件名不在白名单内"), 403
+
+    dest = safe_join(ASSETS_DIR, name)
+    try:
+        with open(dest, "wb") as out:
+            out.write(f.read())
+    except Exception as e:
+        log.exception("写入上传文件失败: %s", name)
+        return jsonify(status="error", reason=str(e)), 500
+    log.info("收到上传: %s (%s bytes)", name, os.path.getsize(dest))
+    return jsonify(status="ok", name=name, size=os.path.getsize(dest))
+
+
 if __name__ == "__main__":
     ensure_dirs()
-    scheduler = create_scheduler()
+    scheduler = None
+    if RENDER_IN_POD:
+        scheduler = create_scheduler()
+    else:
+        log.info("RENDER_IN_POD=0：容器仅托管站点 + 接收 /api/upload，不本地渲染（重型渲染交给常驻机器）")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
