@@ -267,35 +267,58 @@
       .catch(() => { fcDataLoading = false; });
   }
 
-  function fireCloudSearch(city) {
+  async function fireCloudSearch(city) {
     const input = document.getElementById("fc_city");
     if (city) input.value = city;
     const name = input.value.trim();
     if (!name) { fcShowResult(null,"请输入城市名"); return; }
-    // Match city
+    // 1) 本地内置城市表：精确 + 模糊匹配
     let lat, lon, matchName = name;
+    let foundByName = false;
     if (CITIES[name]) {
-      lat = CITIES[name][0]; lon = CITIES[name][1];
+      lat = CITIES[name][0]; lon = CITIES[name][1]; foundByName = true;
     } else {
-      // Fuzzy match
       const keys = Object.keys(CITIES);
       let found = null;
       for (const k of keys) { if (k.includes(name)) { found = k; break; } }
-      if (!found) {
-        for (const k of keys) { if (name.includes(k)) { found = k; break; } }
-      }
-      if (!found) {
-        // Match by pinyin-like or use first char
-        found = keys.find(k => k[0] === name[0]);
-      }
-      if (found) { lat = CITIES[found][0]; lon = CITIES[found][1]; matchName = found; input.value = found; }
-      else { fcShowResult(null,`未找到城市"${name}"`); return; }
+      if (!found) for (const k of keys) { if (name.includes(k)) { found = k; break; } }
+      if (!found) found = keys.find(k => k[0] === name[0]);
+      if (found) { lat = CITIES[found][0]; lon = CITIES[found][1]; matchName = found; input.value = found; foundByName = true; }
+    }
+    // 2) 内置表未命中 → Photon (OpenStreetMap) 兜底，覆盖区县/乡镇/街道一级
+    if (!foundByName) {
+      fcShowResult(null,`正在通过开放街道地图搜索「${name}」…`);
+      const geo = await photonSearch(name);
+      if (!geo) { fcShowResult(null,`未找到「${name}」，请尝试更明确的地名（如 杭州市余杭区 · 苏州工业园区）`); return; }
+      lat = geo.lat; lon = geo.lon; matchName = geo.displayName;
     }
     if (fcDataLoading || !fcCloudArr) { fcShowResult(null,"云数据加载中…"); return; }
     if (!fcCloudData) { fcShowResult(null,"云数据不可用"); return; }
     // Run prediction
     const result = fcPredict(lat, lon, matchName);
     fcShowResult(result);
+  }
+
+  // Photon (OpenStreetMap) 地理编码兜底：可解析到区县/乡镇/街道
+  async function photonSearch(q) {
+    try {
+      // Photon 仅支持 default/en/de/fr，不传 lang 保留中文数据
+      const url = "https://photon.komoot.io/api/?q=" + encodeURIComponent(q) + "&limit=1";
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const j = await r.json();
+      const f = j.features && j.features[0];
+      if (!f || !f.geometry) return null;
+      const p = f.properties || {};
+      const lon = f.geometry.coordinates[0];
+      const lat = f.geometry.coordinates[1];
+      // 拼接上级行政区（区县/乡镇→district，市→city，省→state），帮助区分同名地点
+      const ad = [p.district, p.county, p.city, p.state].filter((v, i, a) => v && v !== p.name && a.indexOf(v) === i);
+      const displayName = [p.name].concat(ad).filter(Boolean).join(" · ").substring(0, 60) || q;
+      return { lat, lon, displayName };
+    } catch (e) {
+      return null;
+    }
   }
 
   function fcPredict(lat, lon, name) {
