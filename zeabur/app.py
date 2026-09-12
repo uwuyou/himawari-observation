@@ -1,221 +1,243 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zeabur 数据处理 Worker
-======================
-常驻服务。通过 APScheduler 定时轮询 NOAA Himawari-9 数据，生成云图、
-云分类图、夜间微物理图和火烧云预测，并把结果 git 直推回 GitHub 仓库
-（仓库再通过 GitHub Pages 自动构建展示网页）。
+Zeabur 一体化服务（纯 Zeabur 方案，不再依赖 GitHub / Vercel）
+================================================================
+一个常驻容器同时干两件事：
+  1) 内置极简静态站点：把 Zeabur 网页服务直接当网站前端用，可从浏览器直接打开。
+  2) 后台定时刷新：每 SCHED_MINUTES 分钟从 NOAA AWS S3 拉取 Himawari-9 数据，
+     生成 红外云图 / 云分类图 / 夜间微物理图 / 火烧云预测，
+     写入共享卷 {DATA_DIR}/assets/，并在末次写一个 obs_time.json 供前端轮询感知刷新。
 
 架构：
-  Zeabur Worker（本服务，常驻，每 SCHED_MINUTES 分钟跑一次）
-      │
-      ├─ clone / pull 你的 himawari-observation 仓库（获取最新脚本）
-      ├─ 运行 scripts/himawari_s3_cloud_map.py 探测最新时次 + 出红外图
-      ├─ 运行 scripts/himawari_cloud_type.py 出云分类图
-      ├─ 运行 scripts/himawari_s3_cloud_map.py --composite night_microphysics
-      ├─ 运行 scripts/fire_cloud_predict.py 出火烧云预测 + 云数据
-      ├─ 更新 index.html 里的观测时间戳
-      └─ git commit + push 回仓库  →  触发 GitHub Pages 部署
+  浏览器 ──>  Zeabur 容器(本服务)
+                     ├─ Flask 静态站：/            -> index.html
+                     │                  /assets/..  -> 共享卷 {DATA_DIR}/assets/..
+                     └─ APScheduler 每 30 分钟：
+                           先探测最新时次(出红外图) -> 再出云分类/夜间微物理/火烧云预测
+                         -> 写 {DATA_DIR}/assets/*.png + *.json + obs_time.json
+
+关键点：Zeabur 是「常驻容器」，没有 Vercel/GitHub 的定时与运行时长限制，
+        所以数据处理(下载 GB 级卫星数据 + satpy 渲染)可以安全跑在这里。
+        图片/JSON 必须放共享卷 {DATA_DIR} 里（挂载 NAS 存储），否则重建容器会丢。
 
 运行（本地调试）：
-    export GITHUB_TOKEN=你的token
-    export GITHUB_REPO=uwuyou/himawari-observation
+    export DATA_DIR=/tmp/himawari_data
     python app.py
 
 环境变量（均可选，有默认值）：
-  GITHUB_TOKEN      必填。用于访问和推送仓库的 PAT。
-  GITHUB_REPO       仓库，默认 uwuyou/himawari-observation
-  WORK_DIR          仓库本地检查目录，默认 /tmp/himawari_repo
-  SCHED_MINUTES     定时周期（分钟），默认 30
-  MAX_BACK_HOURS    向历史回溯探测最新时次的最大小时数，默认 12
+  DATA_DIR        共享数据目录（Zeabur 上挂载 NAS 卷到该路径），默认 /data
+  SCHED_MINUTES   刷新周期（分钟），默认 30
+  MAX_BACK_HOURS  探测最新时次回退范围（小时），默认 12
   CITY_NAME / CITY_LAT / CITY_LON  火烧云预测城市，默认 上海 31.23 121.47
-  PORT              健康检查端口，默认 8080
+  PORT            监听端口（Zeabur 会注入），默认 8080
 """
 
+import datetime as dt
+import json
 import logging
 import os
-import re
-import shutil
 import subprocess
-import datetime as dt
+import sys
+import time
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file
+from werkzeug.utils import safe_join
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("himawari-worker")
+log = logging.getLogger("himawari-svc")
 
 # ---------------- 配置 ----------------
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "uwuyou/himawari-observation").strip()
-WORK_DIR = os.environ.get("WORK_DIR", "/tmp/himawari_repo").strip()
+APP_DIR = os.path.dirname(os.path.abspath(__file__))          # /srv
+WEB_DIR = os.path.join(APP_DIR, "web")                        # 静态站点
+SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")                # 生成脚本
+DATA_DIR = os.environ.get("DATA_DIR", "/data").strip() or "/data"
+ASSETS_DIR = os.path.join(DATA_DIR, "assets")
+
 SCHED_MINUTES = int(os.environ.get("SCHED_MINUTES", "30"))
-MAX_BACK_HOURS = int(os.environ.get("MAX_BACK_HOURS", "12"))
-CITY_NAME = os.environ.get("CITY_NAME", "上海")
+MAX_BACK_HOURS = float(os.environ.get("MAX_BACK_HOURS", "12"))
+CITY_NAME = os.environ.get("CITY_NAME", "上海").strip() or "上海"
 CITY_LAT = os.environ.get("CITY_LAT", "31.23")
 CITY_LON = os.environ.get("CITY_LON", "121.47")
 PORT = int(os.environ.get("PORT", "8080"))
 
-CLONE_URL = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{GITHUB_REPO}.git"
+OBS_FILE = os.path.join(ASSETS_DIR, "obs_time.json")
+PY = sys.executable
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+
+# ---------------- 工具 ----------------
+def _sh(args, cwd=None, timeout=1500):
+    """执行命令，返回 (rc, out)。默认超时 25 分钟（首次下载量大）。"""
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        log.warning("rc=%s 命令失败: %s\n%s", r.returncode, " ".join(args), out[-900:])
+    return r.returncode, out
 
 
-# ---------------- 仓库同步 ----------------
-def _sh(cmd, cwd=None, check=False):
-    """执行 shell 命令并返回 (rc, out)。"""
-    r = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, shell=True
-    )
-    if check and r.returncode != 0:
-        raise RuntimeError(f"命令失败 rc={r.returncode}: {cmd}\n{r.stderr[-800:]}")
-    return r.returncode, (r.stdout or "") + (r.stderr or "")
-
-
-def ensure_repo():
-    """确保本地有仓库副本；没有就 clone，有就 pull 更新。"""
-    if not GITHUB_TOKEN:
-        raise RuntimeError("缺少 GITHUB_TOKEN")
-    if os.path.isdir(os.path.join(WORK_DIR, ".git")):
-        _sh(f"git -C {WORK_DIR} reset --hard && git -C {WORK_DIR} clean -fd && git -C {WORK_DIR} pull --ff-only {CLONE_URL} main", check=True)
-        log.info("仓库已更新")
-    else:
-        shutil.rmtree(WORK_DIR, ignore_errors=True)
-        os.makedirs(os.path.dirname(WORK_DIR), exist_ok=True)
-        _sh(f"git clone --depth 1 --branch main {CLONE_URL} {WORK_DIR}", check=True)
-        log.info("仓库已克隆")
+def ensure_dirs():
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    os.makedirs(WEB_DIR, exist_ok=True)
 
 
 # ---------------- 数据处理 ----------------
-def detect_obs_time():
-    """探测最新可用时次，返回 YYYYMMDDHHMM 或 None。"""
-    rc, out = _sh(
-        f"python himawari_s3_cloud_map.py --latest "
-        f"--composite B13 "
-        f"--out ../assets/ir_latest.png "
-        f"--max-back-hours {MAX_BACK_HOURS}",
-        cwd=os.path.join(WORK_DIR, "scripts"),
-    )
-    m = re.search(r"\d{12}", out)
-    if not m:
-        log.warning("未探测到时次，IR 输出:\n%s", out[-800:])
-        return None
-    return m.group(0)
+def detect_and_ir():
+    """探测最新时次并出红外图。返回 (utc_YYYYMMDDHHMM 或 None, 是否成功)。"""
+    out_png = safe_join(ASSETS_DIR, "ir_latest.png")
+    rc, out = _sh([PY, "himawari_s3_cloud_map.py", "--latest",
+                   "--composite", "B13", "--max-back-hours", str(MAX_BACK_HOURS),
+                   "--out", out_png], cwd=SCRIPTS_DIR)
+    if rc != 0:
+        return None, False
+    # 脚本会打印「自动选定时次（UTC）：YYYYMMDDHHMM」或「自动找出最新时次: ...」
+    for line in out.splitlines():
+        m = None
+        for tok in line.split():
+            if tok.isdigit() and len(tok) == 12:
+                m = tok
+                break
+        if m:
+            return m, True
+    log.warning("未从 IR 输出解析出时次:\n%s", out[-500:])
+    return None, False
 
 
 def run_generation(t_utc):
-    """基于探测到的时次批量生成各类图与预测。"""
-    scripts_dir = os.path.join(WORK_DIR, "scripts")
+    """依次生成 云分类 / 夜间微物理 / 火烧云预测。单项失败不中断。"""
+    ok = {"ir": False, "ct": False, "nm": False, "fc": False}
 
     # 1) 云分类图
+    ct_png = safe_join(ASSETS_DIR, "cloudtype_latest.png")
+    ct_args = [PY, "himawari_cloud_type.py", "--out", ct_png,
+               "--max-back-hours", str(MAX_BACK_HOURS)]
     if t_utc:
-        _sh(f"python himawari_cloud_type.py --time {t_utc} --out ../assets/cloudtype_latest.png",
-            cwd=scripts_dir, check=True)
+        ct_args += ["--time", t_utc]
     else:
-        _sh(f"python himawari_cloud_type.py --latest --max-back-hours {MAX_BACK_HOURS} "
-            f"--out ../assets/cloudtype_latest.png", cwd=scripts_dir, check=True)
+        ct_args += ["--latest"]
+    ok["ct"] = (_sh(ct_args, cwd=SCRIPTS_DIR)[0] == 0)
 
     # 2) 夜间微物理合成图
+    nm_png = safe_join(ASSETS_DIR, "night_microphysics_latest.png")
+    nm_args = [PY, "himawari_s3_cloud_map.py", "--composite", "night_microphysics",
+               "--max-back-hours", str(MAX_BACK_HOURS), "--out", nm_png]
     if t_utc:
-        _sh(f"python himawari_s3_cloud_map.py --time {t_utc} --composite night_microphysics "
-            f"--out ../assets/night_microphysics_latest.png", cwd=scripts_dir, check=True)
+        nm_args += ["--time", t_utc]
     else:
-        _sh(f"python himawari_s3_cloud_map.py --latest --max-back-hours {MAX_BACK_HOURS} "
-            f"--composite night_microphysics --out ../assets/night_microphysics_latest.png",
-            cwd=scripts_dir, check=True)
+        nm_args += ["--latest"]
+    ok["nm"] = (_sh(nm_args, cwd=SCRIPTS_DIR)[0] == 0)
 
-    # 3) 火烧云预测 + 云数据导出
-    base = (f"python fire_cloud_predict.py --lat {CITY_LAT} --lon {CITY_LON} "
-            f"--name {CITY_NAME} "
-            f"--json ../assets/fire_prediction.json "
-            f"--export-cloud-json ../assets/cloud_data.json")
+    # 3) 火烧云预测 + 云数据导出（供前端页面互动查询）
+    fc_json = safe_join(ASSETS_DIR, "fire_prediction.json")
+    cl_json = safe_join(ASSETS_DIR, "cloud_data.json")
+    fc_args = [PY, "fire_cloud_predict.py",
+               "--lat", CITY_LAT, "--lon", CITY_LON, "--name", CITY_NAME,
+               "--json", fc_json, "--export-cloud-json", cl_json,
+               "--max-back-hours", str(MAX_BACK_HOURS)]
     if t_utc:
-        _sh(f"{base} --time {t_utc}", cwd=scripts_dir, check=True)
+        fc_args += ["--time", t_utc]
     else:
-        _sh(f"{base} --latest --max-back-hours {MAX_BACK_HOURS}", cwd=scripts_dir, check=True)
+        fc_args += ["--latest"]
+    ok["fc"] = (_sh(fc_args, cwd=SCRIPTS_DIR)[0] == 0)
+
+    return ok
 
 
-def update_timestamp(t_utc):
-    """更新 index.html 中的观测时间戳。"""
-    idx = os.path.join(WORK_DIR, "index.html")
-    if not os.path.exists(idx):
-        log.warning("index.html 不存在，跳过时间戳更新")
-        return
-    with open(idx, "r", encoding="utf-8") as f:
-        html = f.read()
-    new_html = re.sub(r'const utc = "\d{12}";', f'const utc = "{t_utc}";', html)
-    if new_html != html:
-        with open(idx, "w", encoding="utf-8") as f:
-            f.write(new_html)
-
-
-def commit_push():
-    """提交并推送所有变更到 main。"""
-    git_config = [
-        "git -C %s config user.name 'himawari-bot'" % WORK_DIR,
-        "git -C %s config user.email 'bot@users.noreply.github.com'" % WORK_DIR,
-    ]
-    for c in git_config:
-        _sh(c, check=True)
-    _sh(f"git -C {WORK_DIR} add -A", check=True)
-    rc, out = _sh(f"git -C {WORK_DIR} diff --cached --quiet")
-    if rc == 0:
-        log.info("无内容变更，跳过推送")
-        return False
-    stamp = dt.datetime.utcnow().strftime("%Y%m%d%H%M")
-    _sh(f"git -C {WORK_DIR} commit -m 'auto update Himawari {stamp}'", check=True)
-    _sh(f"git -C {WORK_DIR} pull --rebase {CLONE_URL} main", check=False)
-    rc, out = _sh(f"git -C {WORK_DIR} push {CLONE_URL} main")
-    if rc != 0:
-        _sh(f"git -C {WORK_DIR} push --force-with-lease {CLONE_URL} main", check=True)
-    log.info("已推送最新云图")
-    return True
-
-
-# ---------------- 全局状态 ----------------
-last_run = None
-_next_run = None
+def write_obs_time(t_utc):
+    """写入前端轮询用的 obs_time.json（utc=观测时次，updated=版本号）。"""
+    doc = {
+        "utc": t_utc or "",
+        "updated": int(time.time() * 1000),
+        "city": CITY_NAME,
+        "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp = OBS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False)
+    os.replace(tmp, OBS_FILE)
+    log.info("已写 %s -> %s", OBS_FILE, t_utc or "(无时次)")
 
 
 # ---------------- 定时任务 ----------------
+job_lock = False
+last_run = None
+next_run = None
+
+
 def run_update():
-    log.info("开始本轮数据更新 ...")
+    global job_lock
+    if job_lock:
+        log.info("上一轮仍在运行，跳过")
+        return
+    job_lock = True
+    t0 = time.time()
+    log.info("—— 开始本轮数据刷新 ——")
     try:
-        ensure_repo()
-        t_utc = detect_obs_time()
-        log.info("探测到观测时次: %s", t_utc)
+        t_utc, ir_ok = detect_and_ir()
+        log.info("探测时次: %s (IR成功=%s)", t_utc, ir_ok)
         run_generation(t_utc)
-        update_timestamp(t_utc)
-        commit_push()
-        log.info("本轮更新完成 ✔")
+        write_obs_time(t_utc)
+        log.info("—— 本轮刷新完成，耗时 %.0fs ——", time.time() - t0)
     except Exception as e:
-        log.exception("本轮更新失败: %s", e)
+        log.exception("本轮刷新异常: %s", e)
     finally:
         global last_run
         last_run = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        job_lock = False
 
 
 def create_scheduler():
-    scheduler = BackgroundScheduler(daemon=True)
+    s = BackgroundScheduler(daemon=True)
     trigger = IntervalTrigger(minutes=SCHED_MINUTES)
-    scheduler.add_job(run_update, trigger, next_run_time=dt.datetime.now() + dt.timedelta(seconds=3))
-    scheduler.start()
-    global _next_run
-    _next_run = str(scheduler.get_jobs()[0].next_run_time)
-    log.info("调度器已启动，每 %d 分钟运行一次，首次运行即将触发", SCHED_MINUTES)
-    return scheduler
+    s.add_job(run_update, trigger, next_run_time=dt.datetime.now() + dt.timedelta(seconds=5))
+    s.start()
+    global next_run
+    try:
+        next_run = str(s.get_jobs()[0].next_run_time)
+    except Exception:
+        next_run = "unknown"
+    log.info("调度器已启动，每 %d 分钟刷新一次，首次即将触发", SCHED_MINUTES)
+    return s
 
 
-scheduler = create_scheduler()
-
-
+# ---------------- HTTP 路由 ----------------
 @app.route("/")
+def index():
+    return send_file(os.path.join(WEB_DIR, "index.html"))
+
+
+@app.route("/assets/<path:name>")
+def asset(name):
+    p = safe_join(ASSETS_DIR, name)
+    if not p or not os.path.isfile(p):
+        return ("Not Found", 404)
+    return send_file(p)
+
+
+@app.route("/api/status")
 def status():
-    return jsonify(status="ok", repo=GITHUB_REPO, schedule_minutes=SCHED_MINUTES,
-                   last_run=last_run, next_run=_next_run)
+    obs = {}
+    try:
+        with open(OBS_FILE, "r", encoding="utf-8") as f:
+            obs = json.load(f)
+    except Exception:
+        obs = {}
+    return jsonify(status="ok", schedule_minutes=SCHED_MINUTES,
+                   last_run=last_run, next_run=next_run, obs=obs)
+
+
+@app.route("/api/update", methods=["POST"])
+def manual_update():
+    """手动触发一轮刷新（调试用）。"""
+    import threading
+    threading.Thread(target=run_update, daemon=True).start()
+    return jsonify(status="triggered")
 
 
 if __name__ == "__main__":
+    ensure_dirs()
+    scheduler = create_scheduler()
     app.run(host="0.0.0.0", port=PORT, threaded=True)

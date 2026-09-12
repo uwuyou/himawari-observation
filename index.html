@@ -99,7 +99,7 @@
       </div>
       <div class="imgbox" data-empty="1">
         <div class="load-note">AWAITING FRAME</div>
-        <img src="assets/ir_latest.png" alt="最新红外云图" loading="lazy">
+        <img id="img_ir" src="assets/ir_latest.png" alt="最新红外云图" loading="lazy">
       </div>
       <div class="card-foot"><span class="mono">红外 B13 10.4µm 亮温</span><span class="mono" id="ir_time">--</span></div>
     </section>
@@ -111,7 +111,7 @@
       </div>
       <div class="imgbox" data-empty="1">
         <div class="load-note">AWAITING FRAME</div>
-        <img src="assets/cloudtype_latest.png" alt="最新云分类图" loading="lazy">
+        <img id="img_ct" src="assets/cloudtype_latest.png" alt="最新云分类图" loading="lazy">
       </div>
       <div class="card-foot"><span class="mono">参考 HCAI 分类 · 低云分 St/Sc/Cu</span><span class="mono" id="ct_time">--</span></div>
     </section>
@@ -161,7 +161,7 @@
       </div>
       <div class="imgbox" data-empty="1">
         <div class="load-note">AWAITING FRAME</div>
-        <img src="assets/night_microphysics_latest.png" alt="最新夜间微物理合成图" loading="lazy">
+        <img id="img_nm" src="assets/night_microphysics_latest.png" alt="最新夜间微物理合成图" loading="lazy">
       </div>
       <div class="card-foot">
         <span class="mono">RGB：R=BTD<sub>B15-B13</sub> G=BTD<sub>B13-B07</sub> B=BT13 · JMA 雾监测技术</span>
@@ -206,6 +206,57 @@
   document.getElementById("ir_time").textContent = fmtUTC(utc);
   document.getElementById("ct_time").textContent = fmtUTC(utc);
   document.getElementById("nm_time").textContent = fmtUTC(utc);
+
+  // ========== 自动刷新：从 /assets/obs_time.json 感知最新观测 ==========
+  // Zeabur Worker 每 30 分钟把新图/预测写入共享卷，并刷新 obs_time.json。
+  // 前端每 1 分钟轮询；一旦观测时次变化，就用新版本号重取三张图 + 云数据，实现自动更新。
+  let lastUtc = null;
+  let curVer = Date.now();
+  const IMG_FILES = {"img_ir":"ir_latest.png","img_ct":"cloudtype_latest.png","img_nm":"night_microphysics_latest.png"};
+  function srcUrl(name, ver){ return "assets/"+name+"?"+(ver!=null?"v="+ver:"t="+Date.now()); }
+  function setObsTime(u){
+    if(!u || String(u).length < 12) return;
+    document.querySelector(".obs").textContent = fmtUTC(u);
+    document.querySelector(".bjt").textContent = toBJT(u);
+    if (document.getElementById("ir_time")) document.getElementById("ir_time").textContent = fmtUTC(u);
+    if (document.getElementById("ct_time")) document.getElementById("ct_time").textContent = fmtUTC(u);
+    if (document.getElementById("nm_time")) document.getElementById("nm_time").textContent = fmtUTC(u);
+  }
+  function refreshImages(ver){
+    for (const id in IMG_FILES){ const el = document.getElementById(id); if (el) el.src = srcUrl(IMG_FILES[id], ver); }
+  }
+  function reloadCloudData(){
+    return fetch("assets/cloud_data.json?t="+Date.now())
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(d => {
+        fcCloudData = d;
+        const raw = d.data, L = raw.length;
+        fcCloudArr = new Uint8Array(L);
+        for (let i=0;i<L;i++) fcCloudArr[i] = parseInt(raw[i]);
+        fcDataLoading = false;
+        if (fcLastCity && fcLastLat != null){
+          const r = fcPredict(fcLastLat, fcLastLon, fcLastMatch || fcLastCity, fcKind);
+          fcShowResult(r);
+        }
+      })
+      .catch(()=>{});
+  }
+  function pollData(){
+    fetch("assets/obs_time.json?t="+Date.now())
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(j => {
+        const u = (j && j.utc) || "";
+        const ver = (j && j.updated) || Date.now();
+        if (!u || u.length < 12) return;
+        if (lastUtc === null || u !== lastUtc){
+          lastUtc = u; curVer = ver;
+          setObsTime(u);
+          refreshImages(ver);
+          reloadCloudData();
+        }
+      })
+      .catch(()=>{});
+  }
 
   // ========== 火烧云客户端预测引擎 ==========
   const CITIES = {
@@ -615,6 +666,10 @@
 
   // Initialize on load
   fcSetup();
+
+  // 自动刷新轮询：立即检查一次，之后每 60 秒检查 obs_time.json 是否有新观测
+  pollData();
+  setInterval(pollData, 60000);
 
   // 图片加载完成后隐藏占位
   document.querySelectorAll(".imgbox").forEach(b=>{
