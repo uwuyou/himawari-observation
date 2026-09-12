@@ -1,0 +1,13 @@
+# 本地渲染（在你自己电脑上跑）所需依赖
+# 提示：satpy / cartopy 体积大、安装可能较久；若你本机已装过可跳过重复安装。
+numpy>=1.24
+scipy>=1.10
+xarray>=2023.6
+satpy>=0.44
+pyresample>=1.26
+cartopy>=0.22
+matplotlib>=3.7
+netCDF4>=1.6
+pillow>=10.0
+requests>=2.31
+# rasterio 可选（himawari_cloud_type.py 内部条件导入，缺省时自动降级）

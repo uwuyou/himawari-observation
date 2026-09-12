@@ -141,9 +141,28 @@ def publish(args):
     return 0 if (ok["ir"] and ok_upload.get("obs_time.json")) else 1
 
 
+def load_config_env():
+    """读取同目录下 config.env / .env（KEY=VALUE），写入环境变量。
+    优先级：CLI 参数 > 系统环境变量 > config.env 文件。此函数只 setdefault，
+    不覆盖已存在的环境变量。"""
+    for dirpath in (os.path.join(ROOT, "local"), ROOT):
+        for name in ("config.env", ".env"):
+            pth = os.path.join(dirpath, name)
+            if os.path.isfile(pth):
+                with open(pth, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip())
+                return
+
+
 def main():
+    load_config_env()
     p = argparse.ArgumentParser(description="本机渲染并发布到 Zeabur")
-    p.add_argument("--domain", default=os.environ.get("DOMAIN", "https://sunsetplan.zeabur.app"))
+    p.add_argument("--domain", default=os.environ.get("DOMAIN", ""))
     p.add_argument("--token", default=os.environ.get("UPLOAD_TOKEN", ""))
     p.add_argument("--out", default=os.environ.get("OUT_DIR", os.path.join(ROOT, "assets_out")))
     p.add_argument("--back-hours", type=float, default=float(os.environ.get("MAX_BACK_HOURS", "3")))
@@ -152,7 +171,10 @@ def main():
     p.add_argument("--lon", default=os.environ.get("CITY_LON", "121.47"))
     args = p.parse_args()
     if not args.token:
-        print("错误：需要 --token（=Zeabur 环境变量 UPLOAD_TOKEN）", file=sys.stderr)
+        print("错误：缺少 UPLOAD_TOKEN。可在 local/config.env 里配，或用 --token 传。", file=sys.stderr)
+        return 2
+    if not args.domain:
+        print("错误：缺少 DOMAIN。可在 local/config.env 里配，或用 --domain 传。", file=sys.stderr)
         return 2
     sys.exit(publish(args))
 
