@@ -57,7 +57,9 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data").strip() or "/data"
 ASSETS_DIR = os.path.join(DATA_DIR, "assets")
 
 SCHED_MINUTES = int(os.environ.get("SCHED_MINUTES", "30"))
-MAX_BACK_HOURS = float(os.environ.get("MAX_BACK_HOURS", "12"))
+# 回退小时数：默认从 12 降到 3。卫星最新影像约滞后 15~40 分钟，
+# 3 小时窗口足够覆盖；且帧数少 → 内存峰值显著下降，降低 2GB 实例被驱逐风险。
+MAX_BACK_HOURS = float(os.environ.get("MAX_BACK_HOURS", "3"))
 CITY_NAME = os.environ.get("CITY_NAME", "上海").strip() or "上海"
 CITY_LAT = os.environ.get("CITY_LAT", "31.23")
 CITY_LON = os.environ.get("CITY_LON", "121.47")
@@ -79,6 +81,20 @@ def _sh(args, cwd=None, timeout=1500):
     return r.returncode, out
 
 
+def _run_retry(name, args, cwd=None, tries=3, backoff=15, timeout=1500):
+    """带重试的执行：吸收容器启动初期 / 网络瞬时抖动造成的 DNS、连接失败。"""
+    last = (1, "")
+    for i in range(tries):
+        rc, out = _sh(args, cwd=cwd, timeout=timeout)
+        if rc == 0:
+            return 0, out
+        last = (rc, out)
+        if i < tries - 1:
+            log.warning("%s 第 %s/%s 次失败，%ss 后重试", name, i + 1, tries, backoff)
+            time.sleep(backoff)
+    return last
+
+
 def ensure_dirs():
     os.makedirs(ASSETS_DIR, exist_ok=True)
     os.makedirs(WEB_DIR, exist_ok=True)
@@ -88,9 +104,10 @@ def ensure_dirs():
 def detect_and_ir():
     """探测最新时次并出红外图。返回 (utc_YYYYMMDDHHMM 或 None, 是否成功)。"""
     out_png = safe_join(ASSETS_DIR, "ir_latest.png")
-    rc, out = _sh([PY, "himawari_s3_cloud_map.py", "--latest",
-                   "--composite", "B13", "--max-back-hours", str(MAX_BACK_HOURS),
-                   "--out", out_png], cwd=SCRIPTS_DIR)
+    ir_args = ["himawari_s3_cloud_map.py", "--latest",
+               "--composite", "B13", "--max-back-hours", str(MAX_BACK_HOURS),
+               "--out", out_png]
+    rc, out = _run_retry("红外图", [PY] + ir_args, cwd=SCRIPTS_DIR)
     if rc != 0:
         return None, False
     # 脚本会打印「自动选定时次（UTC）：YYYYMMDDHHMM」或「自动找出最新时次: ...」
@@ -118,7 +135,7 @@ def run_generation(t_utc):
         ct_args += ["--time", t_utc]
     else:
         ct_args += ["--latest"]
-    ok["ct"] = (_sh(ct_args, cwd=SCRIPTS_DIR)[0] == 0)
+    ok["ct"] = (_run_retry("云分类图", [PY] + ct_args, cwd=SCRIPTS_DIR)[0] == 0)
 
     # 2) 夜间微物理合成图
     nm_png = safe_join(ASSETS_DIR, "night_microphysics_latest.png")
@@ -128,7 +145,7 @@ def run_generation(t_utc):
         nm_args += ["--time", t_utc]
     else:
         nm_args += ["--latest"]
-    ok["nm"] = (_sh(nm_args, cwd=SCRIPTS_DIR)[0] == 0)
+    ok["nm"] = (_run_retry("夜间微物理", nm_args, cwd=SCRIPTS_DIR)[0] == 0)
 
     # 3) 火烧云预测 + 云数据导出（供前端页面互动查询）
     fc_json = safe_join(ASSETS_DIR, "fire_prediction.json")
@@ -141,7 +158,7 @@ def run_generation(t_utc):
         fc_args += ["--time", t_utc]
     else:
         fc_args += ["--latest"]
-    ok["fc"] = (_sh(fc_args, cwd=SCRIPTS_DIR)[0] == 0)
+    ok["fc"] = (_run_retry("火烧云预测", fc_args, cwd=SCRIPTS_DIR)[0] == 0)
 
     return ok
 
