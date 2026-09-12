@@ -111,18 +111,48 @@ def render(args):
     return t_utc, ok
 
 
-def upload_one(domain, token, path):
+def optimize_image(path, max_w=1280, max_h=1280):
+    """压缩大图以减小上传体积。大体积 PNG 在国内→Jakarta 链路上上传极易
+    write timeout，压缩后显著降低失败率，同时仍够网页卡片清晰显示。"""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        im = Image.open(path).convert("RGB")
+        w, h = im.size
+        if w > max_w or h > max_h:
+            r = min(max_w / w, max_h / h)
+            im = im.resize((max(1, int(w * r)), max(1, int(h * r))), Image.LANCZOS)
+        im.save(path, "PNG", optimize=True)
+        return os.path.getsize(path)
+    except Exception as e:
+        print(f"[WARN] 优化图片失败 {os.path.basename(path)}: {e}", file=sys.stderr)
+        return None
+
+
+def upload_one(domain, token, path, tries=3, connect_t=15, read_t=180):
+    """单个文件上传，带超时与重试。大文件 write timeout 或临时断链可自愈。"""
     name = os.path.basename(path)
-    with open(path, "rb") as fp:
-        r = requests.post(f"{domain}/api/upload",
-                          files={"file": (name, fp)},
-                          data={"token": token},
-                          timeout=300)
-    if r.status_code != 200:
-        print(f"[WARN] 上传失败 {name}: HTTP {r.status_code} {r.text[:160]}", file=sys.stderr)
-        return False
-    print(f"[INFO] 已上传 {name} ({len(open(path, 'rb').read())}B)")
-    return True
+    size = os.path.getsize(path)
+    for i in range(tries):
+        try:
+            with open(path, "rb") as fp:
+                r = requests.post(f"{domain}/api/upload",
+                                  files={"file": (name, fp)},
+                                  data={"token": token},
+                                  timeout=(connect_t, read_t))
+            if r.status_code == 200:
+                print(f"[INFO] 已上传 {name} ({size}B)")
+                return True
+            print(f"[WARN] 上传失败 {name}: HTTP {r.status_code} {r.text[:160]}", file=sys.stderr)
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] 上传异常 {name}: {e}", file=sys.stderr)
+        if i < tries - 1:
+            wait = 10 * (i + 1)
+            print(f"[WARN] {name} 第 {i+1}/{tries} 次失败，{wait}s 后重试", file=sys.stderr)
+            time.sleep(wait)
+    return False
 
 
 def publish(args):
@@ -132,10 +162,16 @@ def publish(args):
     ok_upload = {}
     for name in ALLOWED:
         p = os.path.join(upload_dir, name)
-        if os.path.isfile(p):
-            ok_upload[name] = upload_one(args.domain, args.token, p)
-        else:
+        if not os.path.isfile(p):
             print(f"[WARN] 本机不存在产物，跳过上传 {name}", file=sys.stderr)
+            ok_upload[name] = False
+            continue
+        if p.endswith(".png"):
+            optimize_image(p)
+        try:
+            ok_upload[name] = upload_one(args.domain, args.token, p)
+        except Exception as e:
+            print(f"[WARN] {name} 上传未完成: {e}", file=sys.stderr)
             ok_upload[name] = False
     print("[INFO] —— 本轮发布完成 ——")
     return 0 if (ok["ir"] and ok_upload.get("obs_time.json")) else 1
