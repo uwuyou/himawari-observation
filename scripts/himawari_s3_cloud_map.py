@@ -145,17 +145,50 @@ def make_scene(dat_files):
     return Scene(filenames=dat_files, reader="ahi_hsd")
 
 
+def _ensure_cjk_font(cache):
+    """若系统无中文字体（GitHub Actions / Docker 容器常见），临时下载 Noto 字体并注册。
+    返回可用字体名；失败返回 None。"""
+    import matplotlib.font_manager as fm
+    import urllib.request
+    if not os.path.exists(cache):
+        url = ("https://github.com/googlefonts/noto-cjk/raw/main/Sans/"
+               "SubsetOTF/SC/NotoSansSC-Regular.otf")
+        req = urllib.request.Request(url, headers={"User-Agent": "himawari-obs"})
+        with urllib.request.urlopen(req, timeout=90) as r, open(cache, "wb") as w:
+            w.write(r.read())
+    fm.fontManager.addfont(cache)
+    return fm.FontProperties(fname=cache).get_name()
+
+
+def setup_cjk_font():
+    """配置 matplotlib 中文字体，返回所选字体名或 None。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.font_manager as fm
+    cjk = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "Noto Sans SC",
+           "Microsoft YaHei", "SimHei")
+    for f in cjk:
+        if any(o.name == f for o in fm.fontManager.ttflist):
+            matplotlib.rcParams["font.sans-serif"] = [f]
+            break
+    else:
+        import tempfile
+        try:
+            cache = os.path.join(tempfile.gettempdir(), "NotoSansSC_cjk.otf")
+            font_name = _ensure_cjk_font(cache)
+            if font_name:
+                matplotlib.rcParams["font.sans-serif"] = [font_name]
+        except Exception as e:
+            print(f"[warn] 中文字体载入失败，标题可能显示为方框: {e}", file=sys.stderr)
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return matplotlib.rcParams.get("font.sans-serif", ["DejaVu Sans"])[0]
+
+
 def plot(scene, composite, bbox, out, sat, res=0.02, dpi=200):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.font_manager as fm
-    for f in ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "Noto Sans SC",
-              "Microsoft YaHei", "SimHei"):
-        if any(o.name == f for o in fm.fontManager.ttflist):
-            matplotlib.rcParams["font.sans-serif"] = [f]
-            break
-    matplotlib.rcParams["axes.unicode_minus"] = False
+    setup_cjk_font()
 
     # 热红外波段（B07-B16）用亮温增强渲染，冷云顶=亮白、暖地表=深灰
     is_ir = bool(re.fullmatch(r"B(0[7-9]|1[0-6])", composite))

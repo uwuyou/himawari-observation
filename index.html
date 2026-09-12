@@ -124,6 +124,10 @@
         <div class="mono">FIRE CLOUD</div>
       </div>
       <div id="fc_body" class="card-body" style="padding:18px">
+        <div style="display:flex;gap:10px;margin-bottom:12px">
+          <button id="kind_set" onclick="fcSetKind('set')" style="flex:1;padding:8px 0;border-radius:8px;border:1px solid;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s">🌅 晚霞 · 火烧云</button>
+          <button id="kind_rise" onclick="fcSetKind('rise')" style="flex:1;padding:8px 0;border-radius:8px;border:1px solid;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s">🌄 朝霞</button>
+        </div>
         <div style="display:flex;gap:10px;margin-bottom:14px">
           <input id="fc_city" type="text" placeholder="输入城市名，如 北京、上海、杭州…" list="fc_cities"
             style="flex:1;background:var(--bg2);border:1px solid var(--line2);border-radius:8px;padding:10px 14px;
@@ -246,8 +250,10 @@
     60:[8.2,10.5,11.6,10.9,8.7,6.8,7.6,10.0,11.5,11.1,9.1,7.4],
   };
   let fcCloudData = null, fcCloudArr = null, fcDataLoading = false;
+  let fcKind = "set", fcLastCity = null, fcLastLat = null, fcLastLon = null, fcLastMatch = null;
 
   function fcSetup() {
+    fcSetKind("set"); // 初始化霞光类型 tab 高亮（默认晚霞火烧云）
     // Populate datalist
     const dl = document.getElementById("fc_cities");
     Object.keys(CITIES).sort().forEach(n => { const o=document.createElement("option"); o.value=n; dl.appendChild(o); });
@@ -294,9 +300,23 @@
     }
     if (fcDataLoading || !fcCloudArr) { fcShowResult(null,"云数据加载中…"); return; }
     if (!fcCloudData) { fcShowResult(null,"云数据不可用"); return; }
-    // Run prediction
-    const result = fcPredict(lat, lon, matchName);
+    // 缓存本次解析结果，供切换朝霞/晚霞时复用，避免重复地理编码
+    fcLastCity = name; fcLastLat = lat; fcLastLon = lon; fcLastMatch = matchName;
+    const result = fcPredict(lat, lon, matchName, fcKind);
     fcShowResult(result);
+  }
+
+  // 切换朝霞 / 晚霞并重新预测
+  function fcSetKind(k) {
+    fcKind = k;
+    const onStyle  = "flex:1;padding:8px 0;border-radius:8px;border:1px solid;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s;opacity:1;background:rgba(255,180,84,.13);border-color:var(--accent2);color:var(--ink)";
+    const offStyle = "flex:1;padding:8px 0;border-radius:8px;border:1px solid;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s;opacity:.55;background:transparent;border-color:var(--line2);color:var(--muted)";
+    document.getElementById("kind_set").setAttribute("style",  k === "set"  ? onStyle : offStyle);
+    document.getElementById("kind_rise").setAttribute("style", k === "rise" ? onStyle : offStyle);
+    if (fcLastCity && fcLastLat != null) {
+      const r = fcPredict(fcLastLat, fcLastLon, fcLastMatch || fcLastCity, fcKind);
+      fcShowResult(r);
+    }
   }
 
   // Photon (OpenStreetMap) 地理编码兜底：可解析到区县/乡镇/街道
@@ -321,7 +341,7 @@
     }
   }
 
-  function fcPredict(lat, lon, name) {
+  function fcPredict(lat, lon, name, kind) {
     const d = fcCloudData;
     const bbox = d.bbox, res = d.res; // bbox=[70,3,140,55]
     const ny = d.ny, nx = d.nx;
@@ -329,19 +349,22 @@
     const dateStr = utc.slice(0,8);
     const y = parseInt(utc.slice(0,4)), m = parseInt(utc.slice(4,6)), dd = parseInt(utc.slice(6,8));
 
-    // Sunset
-    const ss = calcSunset(lat, lon, dateStr);
-    const sunsetUtcStr = ss.sunsetUtc;
-    const sunsetAz = ss.sunsetAz;
-    const sunsetH = parseInt(sunsetUtcStr.slice(8,10));
-    const sunsetM = parseInt(sunsetUtcStr.slice(10,12));
+    // 根据霞光类型选择日出(朝霞)或日落(晚霞火烧云)事件
+    const isRise = kind === "rise";
+    const ev = isRise ? calcSunrise(lat, lon, dateStr) : calcSunset(lat, lon, dateStr);
+    const sunUtcStr = ev.sunUtc;
+    const sunAz = ev.sunAz;
+    const sunH = parseInt(sunUtcStr.slice(8,10));
+    const sunM = parseInt(sunUtcStr.slice(10,12));
+    // 观测时次是否落在日出/日落可行的白天时段内（UTC 01~15）
+    const isDay = sunH >= 1 && sunH <= 15;
     
     // Line speed
     const speed = sunsetLineSpeed(lat, m);
     
-    // Sunset direction sector (±45°)
-    const azMin = (sunsetAz - 45 + 360) % 360;
-    const azMax = (sunsetAz + 45) % 360;
+    // 霞光方向扇区（日出/日落方位 ±45°）
+    const azMin = (sunAz - 45 + 360) % 360;
+    const azMax = (sunAz + 45) % 360;
     
     // Pixel to lat/lon conversion
     const lat0 = bbox[1], lon0 = bbox[0]; // 3, 70
@@ -379,7 +402,7 @@
     }
     
     if (totalPixels === 0) {
-      return fcEmptyResult(lat, lon, name, sunsetUtcStr, sunsetAz, "日落方向 50~500km 范围内无有效数据");
+      return fcEmptyResult(lat, lon, name, sunUtcStr, sunAz, isRise ? "日出方向 50~500km 范围内无有效数据" : "日落方向 50~500km 范围内无有效数据");
     }
     
     const cloudCover = cloudPixels / totalPixels;
@@ -438,15 +461,24 @@
     
     // Direction
     const dirNames = ["北","东北","东","东南","南","西南","西","西北"];
-    const dirIdx = Math.round(sunsetAz / 45) % 8;
+    const dirIdx = Math.round(sunAz / 45) % 8;
     const dirStr = dirIdx % 2 === 0 ? dirNames[dirIdx] : `${dirNames[dirIdx]}偏${dirNames[(dirIdx+1)%8]}`;
-    
+
+    // 朝霞色彩表述（与晚霞略有差异：晨光通常偏粉/橙，高云晕彩更常见）
+    if (isRise) {
+      if (types.includes(5)) colorEst = "紫红至橙红（朝霞对流云）";
+      else if (types.includes(6) || types.includes(7)) colorEst = "粉紫至橙黄（晨光高云晕彩）";
+      else if (types.includes(4)) colorEst = "晨光橙红（中云朝霞）";
+      else if (types.includes(3)) colorEst = "淡金至暖橙（积云朝霞）";
+      else if (types.includes(2)) colorEst = "淡粉至浅金";
+    }
+
     return {
-      name, lat, lon, utc, sunsetUtc: sunsetUtcStr, level, confidence,
-      duration: durationStr, colorEst, direction: `${dirStr}(${sunsetAz.toFixed(0)}°)`,
+      name, lat, lon, utc, kind, sunUtc: sunUtcStr, sunAz, level, confidence,
+      duration: durationStr, colorEst, direction: `${dirStr}(${sunAz.toFixed(0)}°)`,
       cloudCoverPct: Math.round(cloudCover * 100), cloudTypes,
       rawScore, weightedH: weightedH.toFixed(1), LGlow: Math.round(LGlow),
-      speed: speed.toFixed(1), sunsetAz: sunsetAz.toFixed(0)
+      speed: speed.toFixed(1), isDay, isRise
     };
   }
 
@@ -476,6 +508,42 @@
     return { sunsetUtc: utcStr, sunsetAz: az };
   }
 
+  function calcSunrise(lat, lon, yyyymmdd) {
+    const y=parseInt(yyyymmdd.slice(0,4)), m=parseInt(yyyymmdd.slice(4,6)), dd=parseInt(yyyymmdd.slice(6,8));
+    let yy=y, mm=m;
+    if (mm <= 2) { yy -= 1; mm += 12; }
+    const A = Math.floor(yy/100), B = 2 - A + Math.floor(A/4);
+    const jd = Math.floor(365.25*(yy+4716)) + Math.floor(30.6001*(mm+1)) + dd + B - 1524.5;
+    const n = jd - 2451545;
+    const L = ((280.466 + 0.9856474*n) % 360 + 360) % 360;
+    const g = ((357.528 + 0.9856003*n) % 360 + 360) % 360;
+    const lam = ((L + 1.915*Math.sin(g*Math.PI/180) + 0.020*Math.sin(2*g*Math.PI/180)) % 360 + 360) % 360;
+    const obl = 23.439 - 0.0000004*n;
+    const dec = Math.asin(Math.sin(obl*Math.PI/180)*Math.sin(lam*Math.PI/180))*180/Math.PI;
+    const latR = lat*Math.PI/180, decR = dec*Math.PI/180;
+    const cosH = Math.max(-1, Math.min(1, -Math.tan(latR)*Math.tan(decR)));
+    const hAngle = Math.acos(cosH)*180/Math.PI;
+    const eqTime = (L - lam)*4;
+    // 日出：时角位于上午（负号），12 - hAngle/15
+    const sunriseUtc = 12 - hAngle/15 + eqTime/60 - lon/15;
+    const hR = hAngle*Math.PI/180;
+    const E = -Math.cos(decR)*Math.sin(-hR);
+    const N = Math.sin(decR)*Math.cos(latR) - Math.cos(decR)*Math.sin(latR)*Math.cos(hR);
+    const az = (Math.atan2(E,N)*180/Math.PI + 360) % 360;
+    // 归一化 UTC 时刻，处理负值（中国清晨日出多落在 UTC 前一日）
+    let totalMin = Math.round(sunriseUtc*60);
+    let dateStr = yyyymmdd;
+    while (totalMin < 0) { totalMin += 1440; dateStr = prevDay(dateStr); }
+    const hh2 = Math.floor(totalMin/60) % 24;
+    const mmF = totalMin % 60;
+    const utcStr = dateStr + String(hh2).padStart(2,'0') + String(mmF).padStart(2,'0');
+    return { sunUtc: utcStr, sunAz: az };
+  }
+  function prevDay(ymd){
+    const d = new Date(Date.UTC(+ymd.slice(0,4), +ymd.slice(4,6)-1, +ymd.slice(6,8)-1));
+    return d.getUTCFullYear() + String(d.getUTCMonth()+1).padStart(2,'0') + String(d.getUTCDate()).padStart(2,'0');
+  }
+
   function sunsetLineSpeed(lat, month) {
     const speeds = SUNSET_SPEED_TABLE;
     const keys = Object.keys(speeds).map(Number).sort((a,b)=>a-b);
@@ -491,9 +559,9 @@
     return (speeds[best]||speeds[30])[mi];
   }
 
-  function fcEmptyResult(lat,lon,name,sunsetUtc,sunsetAz,reason) {
-    return { name, lat, lon, utc: fcCloudData?.utc||"N/A", sunsetUtc, level: null, confidence: 0,
-      error: reason, direction: `日落方位(${sunsetAz.toFixed(0)}°)` };
+  function fcEmptyResult(lat,lon,name,sunUtc,sunAz,reason) {
+    return { name, lat, lon, utc: fcCloudData?.utc||"N/A", sunUtc, sunAz, level: null, confidence: 0,
+      error: reason, direction: `霞光方位(${sunAz.toFixed(0)}°)` };
   }
 
   function fcShowResult(result, error) {
@@ -504,8 +572,10 @@
       return;
     }
     const lc = {"高":"#ff6b35","中":"#ffb454","低":"#94c0d8","无":"#4a5d7c"}[result.level]||"#4a5d7c";
-    const bjtH = (parseInt(result.sunsetUtc?.slice(8,10)||"0") + 8) % 24;
-    const bjtM = result.sunsetUtc?.slice(10,12)||"00";
+    const kindTag = result.isRise ? "朝霞潜力" : "晚霞火烧云潜力";
+    const evLabel = result.isRise ? "日出时刻" : "日落时刻";
+    const bjtH = (parseInt(result.sunUtc?.slice(8,10)||"0") + 8) % 24;
+    const bjtM = result.sunUtc?.slice(10,12)||"00";
     const cc = result.cloudCoverPct||0;
     div.innerHTML = `
       <div style="display:grid;grid-template-columns:auto 1fr;gap:14px;width:100%">
@@ -513,14 +583,14 @@
           min-width:90px;padding:12px 16px;border-radius:12px;background:rgba(255,255,255,.03);
           border:1px solid ${lc}55">
           <div style="font-size:30px;font-weight:900;color:${lc};line-height:1">${result.level}</div>
-          <div style="font-size:10px;color:var(--muted);letter-spacing:.08em;margin-top:4px">火烧云潜力</div>
+          <div style="font-size:10px;color:var(--muted);letter-spacing:.08em;margin-top:4px">${kindTag}</div>
           <div style="font-size:10px;color:var(--dim);margin-top:5px">信度 ${(result.confidence*100).toFixed(0)}%</div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-size:12.5px;align-content:start">
           <div style="grid-column:1/3"><span style="color:var(--accent2);font-weight:700">${result.name}</span>
             <span style="color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace"> ${result.lat.toFixed(2)}°N ${result.lon.toFixed(2)}°E</span></div>
-          <div><span style="color:var(--dim);font-size:10.5px">日落时刻</span><br>
-            <span style="font-family:'JetBrains Mono',monospace;font-size:12px">${result.sunsetUtc.slice(8,10)}:${result.sunsetUtc.slice(10,12)} UTC</span>
+          <div><span style="color:var(--dim);font-size:10.5px">${evLabel}</span><br>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:12px">${result.sunUtc.slice(8,10)}:${result.sunUtc.slice(10,12)} UTC</span>
             <span style="color:var(--muted);font-size:10.5px;font-family:'JetBrains Mono',monospace"> / ${String(bjtH).padStart(2,"0")}:${bjtM}</span></div>
           <div><span style="color:var(--dim);font-size:10.5px">方位</span><br><span>${result.direction}</span></div>
           <div><span style="color:var(--dim);font-size:10.5px">持续</span><br><span>${result.duration}</span></div>

@@ -329,11 +329,28 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.font_manager as fm
-    for f in ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "Noto Sans SC",
-              "Microsoft YaHei", "SimHei"):
-        if any(o.name == f for o in fm.fontManager.ttflist):
-            matplotlib.rcParams["font.sans-serif"] = [f]
-            break
+    # 中文字体兜底：系统有则直接用；没有（GitHub Actions / Docker 容器）则下载 Noto 注册
+    _cjk_names = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "Noto Sans SC",
+                  "Microsoft YaHei", "SimHei")
+    _have = next((f for f in _cjk_names
+                  if any(o.name == f for o in fm.fontManager.ttflist)), None)
+    if not _have:
+        import os as _os, sys as _sys, tempfile as _tmp, urllib.request as _ur
+        _cache = _os.path.join(_tmp.gettempdir(), "NotoSansSC_cjk.otf")
+        try:
+            if not _os.path.exists(_cache):
+                _u = ("https://github.com/googlefonts/noto-cjk/raw/main/Sans/"
+                      "SubsetOTF/SC/NotoSansSC-Regular.otf")
+                _req = _ur.Request(_u, headers={"User-Agent": "himawari-obs"})
+                with _ur.urlopen(_req, timeout=90) as _r, open(_cache, "wb") as _w:
+                    _w.write(_r.read())
+            fm.fontManager.addfont(_cache)
+            _have = fm.FontProperties(fname=_cache).get_name()
+        except Exception as _e:
+            print(f"[warn] 中文字体载入失败，标题可能显示为方框: {_e}", file=_sys.stderr)
+            _have = None
+    if _have:
+        matplotlib.rcParams["font.sans-serif"] = [_have]
     matplotlib.rcParams["axes.unicode_minus"] = False
 
     fig_w = (lon1 - lon0) / res / args.dpi

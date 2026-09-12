@@ -118,6 +118,59 @@ def _sunset_time_and_azimuth(lat, lon, date=None):
     return utc_str, az
 
 
+def _sunrise_time_and_azimuth(lat, lon, date=None):
+    """计算给定日期/位置的标准日出时间（UTC）和日出方位角（度，正北顺时针）。
+    与日落对称，仅时角取上午（负号）。日出可能落在 UTC 前一日，需跨日回退。"""
+    if date is None:
+        date = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    y, m, d = map(int, date.split("-"))
+
+    if m <= 2:
+        y -= 1; m += 12
+    A = y // 100
+    B = 2 - A + A // 4
+    jd = int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + d + B - 1524.5
+
+    n = jd - 2451545.0
+    L = (280.466 + 0.9856474 * n) % 360
+    g = (357.528 + 0.9856003 * n) % 360
+    lam = (L + 1.915 * math.sin(math.radians(g)) + 0.020 * math.sin(math.radians(2 * g))) % 360
+
+    obl = 23.439 - 0.0000004 * n
+    dec = math.degrees(math.asin(math.sin(math.radians(obl)) * math.sin(math.radians(lam))))
+
+    lat_r = math.radians(lat)
+    dec_r = math.radians(dec)
+    cos_h = -math.tan(lat_r) * math.tan(dec_r)
+    cos_h = max(-1, min(1, cos_h))
+    h_angle = math.degrees(math.acos(cos_h))
+
+    # 日出时间：上午时角为负
+    jd_noon = jd - lon / 360
+    t_noon = jd_noon - 2451545.0
+    eq_time = (L - lam) * 4
+    sunrise_utc = 12 - h_angle / 15 + eq_time / 60 - lon / 15
+
+    # 日出方位角（东侧）
+    h_r = math.radians(h_angle)
+    E = -math.cos(dec_r) * math.sin(-h_r)
+    N = math.sin(dec_r) * math.cos(lat_r) - math.cos(dec_r) * math.sin(lat_r) * math.cos(h_r)
+    az = (math.degrees(math.atan2(E, N))) % 360
+
+    # UTC 时间归一化，处理负值（中国清晨日出多落在 UTC 前一日）
+    total_min = int(round(sunrise_utc * 60))
+    date_obj = dt.datetime.strptime(date, "%Y-%m-%d")
+    while total_min < 0:
+        total_min += 1440
+        date_obj -= dt.timedelta(days=1)
+    hh = (total_min // 60) % 24
+    mm = total_min % 60
+    ymd = date_obj.strftime("%Y%m%d")
+    utc_str = f"{ymd}{hh:02d}{mm:02d}"
+
+    return utc_str, az
+
+
 def _sunset_line_speed(lat, date=None):
     """计算日落线速度 (km/min)。参考火烧云文档附录的查表插值。"""
     if date is None:
@@ -201,6 +254,7 @@ def predict(lat, lon, cls, LON, LAT, obs_time_utc, name=None):
     date_str = f"{obs_time_utc[:4]}-{obs_time_utc[4:6]}-{obs_time_utc[6:8]}"
     sunset_utc_str, sunset_az = _sunset_time_and_azimuth(lat, lon, date_str)
     sunset_line_speed = _sunset_line_speed(lat, date_str)
+    sunrise_utc_str, sunrise_az = _sunrise_time_and_azimuth(lat, lon, date_str)
 
     # 2. 判断是日落还是日出预测
     obs_hour = int(obs_time_utc[8:10])
@@ -376,9 +430,20 @@ def predict(lat, lon, cls, LON, LAT, obs_time_utc, name=None):
     details.append(f"云类分布: {', '.join(f'{k}({CLOUD_NAMES[k]})' for k in sorted(type_counts, key=lambda x: type_counts[x], reverse=True))}")
     details.append(f"火烧云潜力评分: {raw_score:.3f}")
 
+    # 朝霞（日出方位）摘要
+    s_dir_names = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    s_idx = round(sunrise_az / 45) % 8
+    if s_idx % 2 == 0:
+        s_dir = s_dir_names[s_idx]
+    else:
+        s_dir = f"{s_dir_names[s_idx]}偏{s_dir_names[(s_idx + 1) % 8]}"
+
     result = {
         "utc": obs_time_utc,
         "sunset_utc": sunset_utc_str,
+        "sunrise_utc": sunrise_utc_str,
+        "sunrise_az": round(sunrise_az, 0),
+        "sunrise_direction": f"{s_dir}({sunrise_az:.0f}°)",
         "level": level,
         "duration": duration_str,
         "start_rel": f"日落后约{max(1, int(dur_min * 0.3))}分钟",
